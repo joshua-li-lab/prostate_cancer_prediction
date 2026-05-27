@@ -1,0 +1,4488 @@
+"""
+PSA sequence modeling script
+
+Default input:
+    data.xlsx
+
+Required columns:
+    patient_unique_key
+    test_time
+    test_value
+    cancer_ind
+
+Reproducibility notes:
+- .xlsx, .xls, and .csv input files are supported.
+- Patient-level splitting is used to prevent patient leakage.
+- Plot-regeneration data are saved as CSV and optional Excel workbooks.
+"""
+
+# ============================================================
+# BLOCK 0: ENVIRONMENT, IMPORTS
+# ============================================================
+
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+os.environ.setdefault("PYTHONHASHSEED", "42")
+
+import re
+import gc
+import sys
+import json
+import time
+import math
+import random
+import pickle
+import shutil
+import hashlib
+import argparse
+import platform
+import warnings
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tqdm.auto import tqdm
+
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_curve,
+    brier_score_loss,
+    log_loss,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.utils.class_weight import compute_class_weight
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input,
+    LSTM,
+    Dense,
+    Concatenate,
+    Layer,
+    Dropout,
+    LayerNormalization,
+)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# BLOCK 1: GLOBAL CONFIGURATION
+# ============================================================
+
+DATA_PATH = "data.xlsx"
+RESULT_ROOT = "/path/to/data.xlsx"
+
+PID_COL = "patient_unique_key"
+TIME_COL = "test_time"
+PSA_COL = "test_value"
+LABEL_COL = "cancer_ind"
+
+RANDOM_SEED = 42
+AUTO_RUN = True
+
+NS = [4, 5, 6, 7, 8, 9]
+CUTOFFS = [4, 5, 6, 7, 8, 9]
+
+RUN_TASKS = ["next_psa", "multi", "cancer"]
+
+TASK_CONFIGS = {
+    "next_psa": {
+        "exp_name": "exp1_next_psa_level_prediction",
+        "display_name": "Next PSA level prediction",
+        "num_classes": 2,
+        "class_names": ["No Cross", "Cross"],
+    },
+    "multi": {
+        "exp_name": "exp2_next_psa_level_with_temporal_prediction",
+        "display_name": "Next PSA level with temporal prediction",
+        "num_classes": 3,
+        "class_names": ["Never Cross", "Cross 0-12 Months", "Cross After 12 Months"],
+    },
+    "cancer": {
+        "exp_name": "exp3_prostate_cancer_risk_occurrence_prediction",
+        "display_name": "Prostate cancer risk (occurrence) prediction",
+        "num_classes": 2,
+        "class_names": ["No Cancer", "Cancer"],
+    },
+}
+
+TEST_RATIO = 0.20
+N_SPLITS = 4
+TRAIN_RATIO = (1.0 - TEST_RATIO) * (N_SPLITS - 1) / N_SPLITS
+VAL_RATIO = (1.0 - TEST_RATIO) * 1.0 / N_SPLITS
+
+STRATIFY_PATIENT_SPLIT = True
+
+IMBALANCE_METHOD = "class_weight"
+MAX_CLASS_WEIGHT = 30.0
+
+THRESHOLD_METHOD = "f2"
+
+PSA_CAP = 10.0
+USE_LOG1P_PSA_FEATURE = False
+
+T2V_KERNEL_SIZE = 8
+LSTM_UNITS = 64
+DROPOUT_RATE = 0.35
+L2_REG = 3e-4
+USE_ATTENTION = True
+LEARNING_RATE = 3e-4
+GRADIENT_CLIPNORM = 1.0
+
+EPOCHS = 50
+BATCH_SIZE = 64
+PREDICT_BATCH_SIZE = 2048
+EARLY_STOP_PATIENCE = 10
+LR_REDUCE_PATIENCE = 5
+TF_VERBOSE = 1
+
+N_BOOTSTRAP = 1000
+CALIBRATION_METHOD = "platt"  # allowed: "platt", "none"
+
+SAVE_MODELS = True
+SAVE_PLOT_DATA_EXCEL = True
+EXCEL_CHUNK_LONG_TABLES = True
+EXCEL_MAX_ROWS = 1_000_000
+
+PLOT_ATTENTION = True
+PLOT_PSA_TRAJECTORY = True
+RUN_FEATURE_IMPORTANCE = True
+PERMUTATION_REPEATS = 5
+
+MIN_CLASS_COUNT_TO_TRAIN = 5
+
+PLOT_PALETTE = {
+    "primary": "#2C7FB8",
+    "primary_dark": "#08519C",
+    "primary_light": "#9ECAE1",
+    "secondary": "#41B6C4",
+    "neutral": "#4D4D4D",
+    "reference": "#7F7F7F",
+    "calibration": "#3182BD",
+}
+
+ATTENTION_CMAP = "cividis"
+
+
+# ============================================================
+# BLOCK 2: CLI OVERRIDES
+# ============================================================
+
+def parse_args_and_update_config() -> None:
+    global DATA_PATH, RESULT_ROOT, RUN_TASKS
+    global IMBALANCE_METHOD, CALIBRATION_METHOD
+    global TEST_RATIO, N_SPLITS, TRAIN_RATIO, VAL_RATIO
+    global EPOCHS, BATCH_SIZE, RANDOM_SEED
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--result-root", type=str, default=None)
+    parser.add_argument("--run-tasks", nargs="+", default=None, choices=list(TASK_CONFIGS.keys()))
+    parser.add_argument("--imbalance-method", type=str, default=None, choices=["class_weight", "downsample", "none"])
+    parser.add_argument("--calibration-method", type=str, default=None, choices=["platt", "none"])
+    parser.add_argument("--test-ratio", type=float, default=None)
+    parser.add_argument("--n-splits", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+
+    args, _ = parser.parse_known_args()
+
+    if args.data_path is not None:
+        DATA_PATH = args.data_path
+    if args.result_root is not None:
+        RESULT_ROOT = args.result_root
+    if args.run_tasks is not None:
+        RUN_TASKS = args.run_tasks
+    if args.imbalance_method is not None:
+        IMBALANCE_METHOD = args.imbalance_method
+    if args.calibration_method is not None:
+        CALIBRATION_METHOD = args.calibration_method
+    if args.test_ratio is not None:
+        TEST_RATIO = args.test_ratio
+    if args.n_splits is not None:
+        N_SPLITS = args.n_splits
+
+    TRAIN_RATIO = (1.0 - TEST_RATIO) * (N_SPLITS - 1) / N_SPLITS
+    VAL_RATIO = (1.0 - TEST_RATIO) * 1.0 / N_SPLITS
+
+    if args.epochs is not None:
+        EPOCHS = args.epochs
+    if args.batch_size is not None:
+        BATCH_SIZE = args.batch_size
+    if args.seed is not None:
+        RANDOM_SEED = args.seed
+
+
+# ============================================================
+# BLOCK 3: REPRODUCIBILITY AND JSON HELPERS
+# ============================================================
+
+def configure_tf_runtime() -> None:
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:
+        pass
+
+    try:
+        for gpu in tf.config.list_physical_devices("GPU"):
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
+
+
+def set_global_seed(seed: int = 42) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        tf.keras.utils.set_random_seed(seed)
+    except Exception:
+        tf.random.set_seed(seed)
+
+
+def stable_seed(*parts: Any, base_seed: int = RANDOM_SEED) -> int:
+    txt = "|".join([str(base_seed)] + [str(p) for p in parts])
+    h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % (2**31 - 1)
+
+
+def to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, pd.Timestamp):
+        return str(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    return obj
+
+
+def save_json(obj: Any, path: str) -> None:
+    with open(path, "w") as f:
+        json.dump(to_jsonable(obj), f, indent=2)
+
+
+def initialize_new_result_root() -> str:
+    global RESULT_ROOT
+
+    base = Path(RESULT_ROOT).expanduser()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for i in range(100):
+        suffix = stamp if i == 0 else f"{stamp}_{i:02d}"
+        actual = base / f"publication_run_{suffix}"
+        try:
+            actual.mkdir(parents=True, exist_ok=False)
+            RESULT_ROOT = str(actual)
+            return RESULT_ROOT
+        except FileExistsError:
+            continue
+
+    raise RuntimeError("Could not create a unique publication run directory.")
+
+
+def save_code_snapshot() -> None:
+    try:
+        src = Path(__file__).resolve()
+        dst = Path(RESULT_ROOT) / f"script_snapshot_{src.name}"
+        shutil.copy2(src, dst)
+    except Exception as e:
+        save_json(
+            {"warning": f"Could not save code snapshot in notebook mode: {str(e)}"},
+            os.path.join(RESULT_ROOT, "script_snapshot_warning.json"),
+        )
+
+
+def environment_snapshot() -> Dict[str, Any]:
+    return {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "tensorflow": tf.__version__,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "gpu_devices": [str(x) for x in tf.config.list_physical_devices("GPU")],
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+# ============================================================
+# BLOCK 4: DATA LOADING AND PATIENT CACHE
+# ============================================================
+
+def read_input_table(data_path: str) -> pd.DataFrame:
+    path = Path(data_path).expanduser()
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Input data file not found: {path}. "
+            "Place data.xlsx in the repository root or pass --data-path."
+        )
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        return pd.read_csv(path)
+
+    if suffix == ".xlsx":
+        try:
+            return pd.read_excel(path, engine="openpyxl")
+        except ImportError as e:
+            raise ImportError(
+                "Reading .xlsx files requires openpyxl. Install with:\n"
+                "    pip install openpyxl"
+            ) from e
+
+    if suffix == ".xls":
+        return pd.read_excel(path)
+
+    raise ValueError(f"Unsupported input extension '{suffix}'. Use .xlsx, .xls, or .csv.")
+
+
+def coerce_datetime_column_for_publication(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
+
+
+def load_psa_data(data_path: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    raw = read_input_table(data_path)
+
+    required = [PID_COL, TIME_COL, PSA_COL, LABEL_COL]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found columns: {list(raw.columns)}")
+
+    raw_patient_count = int(raw[PID_COL].nunique(dropna=True))
+
+    df = raw[required].copy()
+    df[TIME_COL] = coerce_datetime_column_for_publication(df[TIME_COL])
+    df[PSA_COL] = pd.to_numeric(df[PSA_COL], errors="coerce")
+    df[LABEL_COL] = pd.to_numeric(df[LABEL_COL], errors="coerce")
+
+    df = df.dropna(subset=[PID_COL, TIME_COL, PSA_COL, LABEL_COL]).copy()
+    df[LABEL_COL] = df[LABEL_COL].astype(int)
+    df[LABEL_COL] = df.groupby(PID_COL)[LABEL_COL].transform("max").astype(int)
+    df = df.sort_values([PID_COL, TIME_COL]).reset_index(drop=True)
+
+    audit = {
+        "source_file": str(Path(data_path).expanduser()),
+        "source_extension": Path(data_path).suffix.lower(),
+        "raw_rows": int(len(raw)),
+        "raw_patients": raw_patient_count,
+        "usable_rows": int(len(df)),
+        "usable_patients": int(df[PID_COL].nunique()),
+        "psa_min": float(df[PSA_COL].min()),
+        "psa_median": float(df[PSA_COL].median()),
+        "psa_max": float(df[PSA_COL].max()),
+        "note": (
+            "Highest-daily PSA preprocessing and diagnosis-date temporal filtering "
+            "are not used in this version."
+        ),
+    }
+    return df, audit
+
+
+def build_patient_cache(df: pd.DataFrame, min_cache_len: int) -> List[Dict[str, Any]]:
+    sizes = df.groupby(PID_COL).size()
+    keep_pids = set(sizes[sizes >= min_cache_len].index)
+    df_keep = df[df[PID_COL].isin(keep_pids)].copy()
+
+    cache = []
+    grouped = df_keep.groupby(PID_COL, sort=False)
+
+    for pid, grp in tqdm(grouped, desc="Building Patient Cache"):
+        grp = grp.sort_values(TIME_COL)
+        cache.append({
+            "pid": pid,
+            "num_psa": int(len(grp)),
+            "psa": grp[PSA_COL].to_numpy(dtype=np.float32),
+            "times": grp[TIME_COL].to_numpy(dtype="datetime64[ns]"),
+            "label": int(grp[LABEL_COL].iloc[0]),
+        })
+
+    return cache
+
+
+def build_patient_lookup(patient_cache: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    return {rec["pid"]: rec for rec in patient_cache}
+
+
+# ============================================================
+# BLOCK 5: ROUND AUDIT AND K-FOLD SPLITTING
+# ============================================================
+
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def min_required_for_task(task: str, n: int) -> int:
+    if task == "cancer":
+        return n
+    return n + 1
+
+
+def compute_round_patient_table(
+    patient_cache: List[Dict[str, Any]],
+    n: int,
+    cutoff: float,
+    task: str,
+) -> pd.DataFrame:
+    min_required = min_required_for_task(task, n)
+    rows = []
+
+    for rec in patient_cache:
+        if rec["num_psa"] < min_required:
+            continue
+
+        psas = rec["psa"]
+        times = rec["times"]
+        pid = rec["pid"]
+        label = rec["label"]
+
+        eligible = bool(np.all(psas[:n] < cutoff))
+        y = -1
+
+        if eligible:
+            if task == "next_psa":
+                y = int(psas[n] >= cutoff)
+
+            elif task == "cancer":
+                y = int(label)
+
+            elif task == "multi":
+                future_psa = psas[n:]
+                future_times = times[n:]
+                exceed_positions = np.where(future_psa >= cutoff)[0]
+
+                if len(exceed_positions) == 0:
+                    y = 0
+                else:
+                    first_pos = int(exceed_positions[0])
+                    input_end_time = times[n - 1]
+                    exceed_time = future_times[first_pos]
+                    days_to_exceed = (exceed_time - input_end_time) / np.timedelta64(1, "D")
+                    y = 1 if days_to_exceed <= 365 else 2
+            else:
+                raise ValueError(f"Unknown task: {task}")
+
+        split_stratum = f"eligible_y{int(y)}" if eligible else "not_eligible"
+
+        rows.append({
+            "patient_id": pid,
+            "num_psa": rec["num_psa"],
+            "eligible": eligible,
+            "y": int(y),
+            "label": int(label),
+            "split_stratum": split_stratum,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def safe_train_test_split(pids, groups, test_size, seed):
+    pids = np.asarray(pids, dtype=object)
+
+    if len(pids) < 2:
+        return pids, np.array([], dtype=object)
+
+    if groups is not None:
+        try:
+            return train_test_split(
+                pids,
+                test_size=test_size,
+                random_state=seed,
+                stratify=groups,
+            )
+        except ValueError:
+            pass
+
+    return train_test_split(
+        pids,
+        test_size=test_size,
+        random_state=seed,
+        stratify=None,
+    )
+
+
+def split_round_patients_kfold(
+    round_df,
+    seed,
+    n_splits=N_SPLITS,
+    test_ratio=TEST_RATIO,
+):
+    if len(round_df) == 0:
+        return np.array([], dtype=object), []
+
+    pids = round_df["patient_id"].to_numpy(dtype=object)
+
+    groups = None
+    if STRATIFY_PATIENT_SPLIT:
+        gv = round_df["split_stratum"].astype(str).to_numpy()
+        counts = pd.Series(gv).value_counts()
+        if counts.min() >= 2 and len(counts) > 1:
+            groups = gv
+
+    trainval_pids, test_pids = safe_train_test_split(
+        pids=pids,
+        groups=groups,
+        test_size=test_ratio,
+        seed=seed,
+    )
+    test_pids = np.array(test_pids, dtype=object)
+
+    trainval_df = round_df[round_df["patient_id"].isin(trainval_pids)].copy()
+    trainval_pids_arr = trainval_df["patient_id"].to_numpy(dtype=object)
+
+    if len(trainval_pids_arr) < n_splits:
+        if len(trainval_pids_arr) < 2:
+            return test_pids, [(trainval_pids_arr, np.array([], dtype=object))]
+
+        train_p, val_p = safe_train_test_split(
+            pids=trainval_pids_arr,
+            groups=None,
+            test_size=1.0 / n_splits,
+            seed=seed,
+        )
+        return test_pids, [(np.array(train_p, dtype=object), np.array(val_p, dtype=object))]
+
+    use_strat = False
+    if STRATIFY_PATIENT_SPLIT:
+        tv_groups = trainval_df["split_stratum"].astype(str).to_numpy()
+        gcounts = pd.Series(tv_groups).value_counts()
+        if (gcounts.min() >= n_splits) and (len(gcounts) > 1):
+            use_strat = True
+
+    if use_strat:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        split_iter = skf.split(trainval_pids_arr, tv_groups)
+    else:
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        split_iter = kf.split(trainval_pids_arr)
+
+    folds = []
+    for tr_idx, val_idx in split_iter:
+        folds.append((
+            np.array(trainval_pids_arr[tr_idx], dtype=object),
+            np.array(trainval_pids_arr[val_idx], dtype=object),
+        ))
+
+    return test_pids, folds
+
+
+def verify_no_patient_leakage(test_pids, folds):
+    test_set = set(test_pids.tolist())
+    report = {
+        "n_test": len(test_set),
+        "n_folds": len(folds),
+        "fold_sizes": [],
+        "test_overlaps_trainval_per_fold": [],
+        "train_val_overlaps_per_fold": [],
+        "all_ok": True,
+    }
+
+    for i, (tr, va) in enumerate(folds):
+        tr_set = set(tr.tolist())
+        va_set = set(va.tolist())
+
+        report["fold_sizes"].append({
+            "fold": i,
+            "n_train": len(tr_set),
+            "n_val": len(va_set),
+        })
+
+        overlap_test_tr = len(test_set & tr_set)
+        overlap_test_va = len(test_set & va_set)
+        overlap_tr_va = len(tr_set & va_set)
+
+        report["test_overlaps_trainval_per_fold"].append({
+            "fold": i,
+            "test_train_overlap": overlap_test_tr,
+            "test_val_overlap": overlap_test_va,
+        })
+        report["train_val_overlaps_per_fold"].append({
+            "fold": i,
+            "train_val_overlap": overlap_tr_va,
+        })
+
+        if overlap_test_tr or overlap_test_va or overlap_tr_va:
+            report["all_ok"] = False
+
+    if not report["all_ok"]:
+        raise RuntimeError(f"Patient-level leakage detected: {report}")
+
+    return report
+
+
+def summarize_round_audit_kfold(
+    round_df,
+    test_pids,
+    folds,
+    raw_patient_count,
+    n,
+    cutoff,
+    task,
+):
+    eligible_df = round_df[round_df["eligible"]].copy()
+
+    global_summary: Dict[str, Any] = {
+        "n": int(n),
+        "cutoff": float(cutoff),
+        "task": task,
+        "raw_patients": int(raw_patient_count),
+        "patients_with_min_len": int(len(round_df)),
+        "eligible_patients": int(len(eligible_df)),
+        "test_ratio": float(TEST_RATIO),
+        "n_splits": int(N_SPLITS),
+        "approx_train_ratio": float(TRAIN_RATIO),
+        "approx_val_ratio": float(VAL_RATIO),
+    }
+
+    if task in ["next_psa", "cancer"]:
+        pos = int((eligible_df["y"] == 1).sum())
+        neg = int((eligible_df["y"] == 0).sum())
+        prev = pos / (pos + neg) if (pos + neg) > 0 else 0.0
+        global_summary.update({"positive": pos, "negative": neg, "prevalence": float(prev)})
+    else:
+        for cls in [0, 1, 2]:
+            global_summary[f"class_{cls}"] = int((eligible_df["y"] == cls).sum())
+
+    def _split_stats(name, ids):
+        sub = round_df[round_df["patient_id"].isin(ids)].copy()
+        elig_sub = sub[sub["eligible"]].copy()
+
+        row: Dict[str, Any] = {
+            "split": name,
+            "patients_with_min_len": int(len(sub)),
+            "eligible_patients": int(len(elig_sub)),
+        }
+
+        if task in ["next_psa", "cancer"]:
+            pos = int((elig_sub["y"] == 1).sum())
+            neg = int((elig_sub["y"] == 0).sum())
+            prev = pos / (pos + neg) if (pos + neg) > 0 else 0.0
+            row.update({"positive": pos, "negative": neg, "prevalence": float(prev)})
+        else:
+            for cls in [0, 1, 2]:
+                row[f"class_{cls}"] = int((elig_sub["y"] == cls).sum())
+
+        return row
+
+    split_rows = [_split_stats("test", set(test_pids.tolist()))]
+    for i, (tr, va) in enumerate(folds):
+        split_rows.append(_split_stats(f"fold{i}_train", set(tr.tolist())))
+        split_rows.append(_split_stats(f"fold{i}_val", set(va.tolist())))
+
+    return {"global": global_summary, "splits": split_rows}
+
+
+def print_round_audit(audit_summary, n, cutoff, task):
+    g = audit_summary["global"]
+    split_rows = audit_summary["splits"]
+    cutoff_s = f"{cutoff:.1f}"
+    min_len = min_required_for_task(task, n)
+
+    print("\n" + "=" * 64)
+    print(f"Global Audit  (N = {n}, PSA cutoff = {cutoff_s})")
+    print("=" * 64)
+    print(f"Patients in raw data                         : {g['raw_patients']:,}")
+    print(f"Patients with >= {min_len} PSA measurements        : {g['patients_with_min_len']:,}")
+    print(f"Patients eligible, first {n} all < {cutoff_s}      : {g['eligible_patients']:,}")
+    print(
+        f"K-fold setup: test_ratio={g['test_ratio']:.2f}, "
+        f"n_splits={g['n_splits']} => approx train/val/test = "
+        f"{g['approx_train_ratio']:.2f}/{g['approx_val_ratio']:.2f}/{g['test_ratio']:.2f}"
+    )
+
+    if task == "next_psa":
+        print(f"  Positive ({ordinal(n + 1)} PSA >= {cutoff_s}) : {g['positive']:,}")
+        print(f"  Negative ({ordinal(n + 1)} PSA <  {cutoff_s}) : {g['negative']:,}")
+        print(f"  Global prevalence                   : {g['prevalence']:.4f}")
+    elif task == "cancer":
+        print(f"  Positive, label = 1                 : {g['positive']:,}")
+        print(f"  Negative, label = 0                 : {g['negative']:,}")
+        print(f"  Global prevalence                   : {g['prevalence']:.4f}")
+    else:
+        print(f"  Class 0, never crosses              : {g['class_0']:,}")
+        print(f"  Class 1, crosses within 12 months   : {g['class_1']:,}")
+        print(f"  Class 2, crosses after 12 months    : {g['class_2']:,}")
+
+    print("\n" + "=" * 64)
+    print(f"Per-Split Audit  (seed={RANDOM_SEED}, K={g['n_splits']})")
+    print("=" * 64)
+    print(pd.DataFrame(split_rows).to_string(index=False))
+
+
+# ============================================================
+# BLOCK 6: SEQUENCE BANK
+# ============================================================
+
+def build_sequence_bank(
+    patient_cache,
+    round_df,
+    n,
+    cutoff,
+    task,
+    patient_lookup: Optional[Dict[Any, Dict[str, Any]]] = None,
+):
+    eligible_df = round_df[round_df["eligible"]].copy()
+    if len(eligible_df) == 0:
+        return None
+
+    feature_names = ["psa_capped", "psa_velocity_per_day", "delta_days"]
+
+    X_list, y_list, pid_list, label_list, meta_rows = [], [], [], [], []
+
+    if patient_lookup is None:
+        patient_lookup = build_patient_lookup(patient_cache)
+
+    for _, row in eligible_df.iterrows():
+        pid = row["patient_id"]
+        if pid not in patient_lookup:
+            continue
+
+        rec = patient_lookup[pid]
+        y = int(row["y"])
+
+        psas_raw = rec["psa"]
+        times = rec["times"]
+        label = rec["label"]
+
+        input_raw = psas_raw[:n].astype(np.float32)
+        input_times = times[:n]
+
+        input_feat = (
+            np.minimum(input_raw, PSA_CAP).astype(np.float32)
+            if PSA_CAP is not None else input_raw.astype(np.float32)
+        )
+
+        if USE_LOG1P_PSA_FEATURE:
+            input_feat = np.log1p(input_feat).astype(np.float32)
+
+        deltas = np.zeros(n, dtype=np.float32)
+        velocities = np.zeros(n, dtype=np.float32)
+
+        if n > 1:
+            d = (input_times[1:n] - input_times[0:n - 1]) / np.timedelta64(1, "D")
+            d = d.astype(np.float32)
+            deltas[1:] = d
+            safe_d = np.where(d > 0, d, 1.0).astype(np.float32)
+            v = np.where(
+                d > 0,
+                (input_feat[1:n] - input_feat[0:n - 1]) / safe_d,
+                0.0,
+            ).astype(np.float32)
+            velocities[1:] = v
+
+        feats = np.stack([input_feat, velocities, deltas], axis=1).astype(np.float32)
+
+        target_time = pd.NaT
+        target_psa = np.nan
+
+        if task == "next_psa":
+            target_time = pd.to_datetime(times[n])
+            target_psa = float(psas_raw[n])
+
+        elif task == "multi":
+            future_psa = psas_raw[n:]
+            future_times = times[n:]
+            exceed_positions = np.where(future_psa >= cutoff)[0]
+            if len(exceed_positions) > 0:
+                pos = int(exceed_positions[0])
+                target_time = pd.to_datetime(future_times[pos])
+                target_psa = float(future_psa[pos])
+
+        followup_days_after_input = float((times[-1] - input_times[-1]) / np.timedelta64(1, "D"))
+        num_future_psa = int(max(0, len(times) - n))
+
+        target_days_after_input_end = np.nan
+        if pd.notna(target_time):
+            target_days_after_input_end = float(
+                (np.datetime64(target_time) - input_times[-1]) / np.timedelta64(1, "D")
+            )
+
+        possible_censoring_never_lt_12m = bool(
+            task == "multi" and y == 0 and followup_days_after_input < 365
+        )
+
+        X_list.append(feats)
+        y_list.append(y)
+        pid_list.append(pid)
+        label_list.append(label)
+
+        meta_rows.append({
+            "patient_id": pid,
+            "label": int(label),
+            "task_y": int(y),
+            "input_start_time": pd.to_datetime(input_times[0]),
+            "input_end_time": pd.to_datetime(input_times[-1]),
+            "target_time": target_time,
+            "target_psa": target_psa,
+            "last_input_psa_raw": float(input_raw[-1]),
+            "last_input_psa_feature": float(input_feat[-1]),
+            "cutoff": float(cutoff),
+            "n": int(n),
+            "last_observed_time": pd.to_datetime(times[-1]),
+            "followup_days_after_input": followup_days_after_input,
+            "num_future_psa": num_future_psa,
+            "target_days_after_input_end": target_days_after_input_end,
+            "possible_censoring_never_lt_12m": possible_censoring_never_lt_12m,
+        })
+
+    if len(X_list) == 0:
+        return None
+
+    return {
+        "X": np.array(X_list, dtype=np.float32),
+        "y": np.array(y_list, dtype=np.int32),
+        "pids": np.array(pid_list, dtype=object),
+        "labels": np.array(label_list, dtype=np.int32),
+        "meta": pd.DataFrame(meta_rows),
+        "feature_names": feature_names,
+    }
+
+
+def subset_sequence_bank(bank: Dict[str, Any], split_patient_ids):
+    if bank is None:
+        return None
+
+    split_set = set(np.asarray(split_patient_ids, dtype=object).tolist())
+    mask = np.array([pid in split_set for pid in bank["pids"]], dtype=bool)
+
+    if not mask.any():
+        return None
+
+    return (
+        bank["X"][mask],
+        bank["y"][mask],
+        bank["pids"][mask],
+        bank["labels"][mask],
+        bank["meta"].iloc[np.where(mask)[0]].reset_index(drop=True),
+        bank["feature_names"],
+    )
+
+
+# ============================================================
+# BLOCK 7: SCALING AND IMBALANCE HANDLING
+# ============================================================
+
+def fit_scaler(X_train):
+    n_samples, n_steps, n_features = X_train.shape
+    scaler = StandardScaler()
+    scaler.fit(X_train.reshape(-1, n_features))
+    return scaler
+
+
+def apply_scaler(X, scaler):
+    n_samples, n_steps, n_features = X.shape
+    return scaler.transform(X.reshape(-1, n_features)).reshape(
+        n_samples,
+        n_steps,
+        n_features,
+    ).astype(np.float32)
+
+
+def handle_imbalance_train(X_train, y_train, method, seed):
+    classes = np.unique(y_train)
+
+    if method == "none":
+        return X_train, y_train, None
+
+    if method == "class_weight":
+        weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+        class_weight = {
+            int(c): float(min(w, MAX_CLASS_WEIGHT))
+            for c, w in zip(classes, weights)
+        }
+        return X_train, y_train, class_weight
+
+    if method == "downsample":
+        rng = np.random.RandomState(seed)
+        min_count = min(int(np.sum(y_train == c)) for c in classes)
+        keep = []
+
+        for c in classes:
+            idx = np.where(y_train == c)[0]
+            keep.extend(rng.choice(idx, size=min_count, replace=False))
+
+        keep = np.array(keep)
+        rng.shuffle(keep)
+
+        return X_train[keep], y_train[keep], None
+
+    raise ValueError(f"Unknown IMBALANCE_METHOD: {method}")
+
+
+# ============================================================
+# BLOCK 8: CUSTOM KERAS LAYERS
+# ============================================================
+
+@tf.keras.utils.register_keras_serializable()
+class Time2Vec(Layer):
+    def __init__(self, kernel_size: int = 8, **kwargs):
+        super().__init__(**kwargs)
+        self.k = int(kernel_size)
+
+    def build(self, input_shape):
+        self.wb = self.add_weight(name="wb", shape=(1,), initializer="uniform", trainable=True)
+        self.bb = self.add_weight(name="bb", shape=(1,), initializer="uniform", trainable=True)
+        self.wa = self.add_weight(name="wa", shape=(1, self.k), initializer="uniform", trainable=True)
+        self.ba = self.add_weight(name="ba", shape=(1, self.k), initializer="uniform", trainable=True)
+        super().build(input_shape)
+
+    def call(self, x):
+        linear = self.wb * x + self.bb
+        periodic = tf.math.sin(tf.matmul(x, self.wa) + self.ba)
+        return tf.concat([linear, periodic], axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"kernel_size": self.k})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable()
+class AttentionPool(Layer):
+    def build(self, input_shape):
+        d = input_shape[-1]
+        self.W = self.add_weight(name="W", shape=(d, d), initializer="glorot_uniform", trainable=True)
+        self.v = self.add_weight(name="v", shape=(d, 1), initializer="glorot_uniform", trainable=True)
+        super().build(input_shape)
+
+    def call(self, x):
+        u = tf.tanh(tf.matmul(x, self.W))
+        score = tf.matmul(u, self.v)
+        alpha = tf.nn.softmax(score, axis=1)
+        context = tf.reduce_sum(alpha * x, axis=1)
+        return context, alpha
+
+
+@tf.keras.utils.register_keras_serializable()
+class SelectTimeFeature(Layer):
+    def __init__(self, time_feature_index: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self.time_feature_index = int(time_feature_index)
+
+    def call(self, x):
+        i = self.time_feature_index
+        return x[:, :, i:i + 1]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"time_feature_index": self.time_feature_index})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable()
+class RemoveTimeFeature(Layer):
+    def __init__(self, time_feature_index: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self.time_feature_index = int(time_feature_index)
+
+    def call(self, x):
+        i = self.time_feature_index
+        parts = []
+        if i > 0:
+            parts.append(x[:, :, :i])
+        parts.append(x[:, :, i + 1:])
+        if len(parts) == 1:
+            return parts[0]
+        return tf.concat(parts, axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"time_feature_index": self.time_feature_index})
+        return config
+
+
+# ============================================================
+# BLOCK 9: MODEL
+# ============================================================
+
+def build_model(n_timesteps, n_features, num_classes, time_feature_index=2):
+    inp = Input(shape=(n_timesteps, n_features), name="input_seq")
+
+    time_feat = SelectTimeFeature(
+        time_feature_index=time_feature_index,
+        name="time_feature",
+    )(inp)
+
+    other_feat = RemoveTimeFeature(
+        time_feature_index=time_feature_index,
+        name="non_time_features",
+    )(inp)
+
+    t2v = Time2Vec(kernel_size=T2V_KERNEL_SIZE, name="time2vec")(time_feat)
+    embedded = Concatenate(name="concat_features")([other_feat, t2v])
+    embedded = LayerNormalization(name="layer_norm")(embedded)
+
+    attn_alpha = None
+
+    if USE_ATTENTION:
+        h = LSTM(
+            LSTM_UNITS,
+            return_sequences=True,
+            dropout=DROPOUT_RATE,
+            recurrent_dropout=0.0,
+            kernel_regularizer=l2(L2_REG),
+            name="lstm",
+        )(embedded)
+
+        context, attn_alpha = AttentionPool(name="attention")(h)
+        z = Dropout(DROPOUT_RATE, name="dropout_after_attention")(context)
+
+    else:
+        z = LSTM(
+            LSTM_UNITS,
+            return_sequences=False,
+            dropout=DROPOUT_RATE,
+            recurrent_dropout=0.0,
+            kernel_regularizer=l2(L2_REG),
+            name="lstm",
+        )(embedded)
+
+        z = Dropout(DROPOUT_RATE, name="dropout_after_lstm")(z)
+
+    if num_classes == 2:
+        out = Dense(
+            1,
+            activation="sigmoid",
+            kernel_regularizer=l2(L2_REG),
+            name="output",
+        )(z)
+
+        loss_fn = "binary_crossentropy"
+        metrics = [
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc", curve="ROC"),
+        ]
+
+    else:
+        out = Dense(
+            num_classes,
+            activation="softmax",
+            kernel_regularizer=l2(L2_REG),
+            name="output",
+        )(z)
+
+        loss_fn = "sparse_categorical_crossentropy"
+        metrics = ["accuracy"]
+
+    model = Model(inputs=inp, outputs=out)
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE, clipnorm=GRADIENT_CLIPNORM),
+        loss=loss_fn,
+        metrics=metrics,
+    )
+
+    attn_model = None
+    if USE_ATTENTION and attn_alpha is not None:
+        attn_model = Model(inputs=inp, outputs=attn_alpha)
+
+    return model, attn_model
+
+
+def predict_model(model: Model, X: np.ndarray) -> np.ndarray:
+    return model.predict(X, batch_size=PREDICT_BATCH_SIZE, verbose=0)
+
+
+def load_saved_model_for_posthoc(model_path: str) -> Model:
+    try:
+        return tf.keras.models.load_model(model_path, compile=False)
+    except Exception:
+        return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
+
+
+def make_attention_extractor(model: Model) -> Optional[Model]:
+    if not USE_ATTENTION:
+        return None
+
+    try:
+        out = model.get_layer("attention").output
+        if isinstance(out, (list, tuple)):
+            alpha = out[1]
+        else:
+            return None
+        return Model(inputs=model.input, outputs=alpha)
+    except Exception:
+        return None
+
+
+# ============================================================
+# BLOCK 10: PLATT CALIBRATION AND F2 THRESHOLDING
+# ============================================================
+
+def clip_prob(p, eps=1e-7):
+    return np.clip(np.asarray(p, dtype=np.float64), eps, 1.0 - eps)
+
+
+def renormalize_proba(p, eps=1e-7):
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p, eps, 1.0)
+    row_sum = p.sum(axis=1, keepdims=True)
+    row_sum = np.where(row_sum > 0, row_sum, 1.0)
+    return p / row_sum
+
+
+def fit_and_apply_calibration(p_val_raw, y_val, p_test_raw, method):
+    p_val_raw = clip_prob(p_val_raw)
+    p_test_raw = clip_prob(p_test_raw)
+
+    if method == "none" or len(np.unique(y_val)) < 2:
+        return p_val_raw, p_test_raw, None
+
+    if method != "platt":
+        raise ValueError("CALIBRATION_METHOD must be 'platt' or 'none'. Isotonic was removed.")
+
+    logit_val = np.log(p_val_raw / (1.0 - p_val_raw)).reshape(-1, 1)
+    logit_test = np.log(p_test_raw / (1.0 - p_test_raw)).reshape(-1, 1)
+
+    lr = LogisticRegression(max_iter=1000)
+    lr.fit(logit_val, y_val)
+
+    p_val = lr.predict_proba(logit_val)[:, 1]
+    p_test = lr.predict_proba(logit_test)[:, 1]
+
+    return clip_prob(p_val), clip_prob(p_test), lr
+
+
+def fit_and_apply_multiclass_calibration(
+    p_val_raw: np.ndarray,
+    y_val: np.ndarray,
+    p_test_raw: np.ndarray,
+    method: str,
+    num_classes: int,
+):
+    p_val_raw = renormalize_proba(p_val_raw)
+    p_test_raw = renormalize_proba(p_test_raw)
+
+    info = {
+        "method": method,
+        "applied": False,
+        "reason": None,
+        "validation_classes": sorted([int(x) for x in np.unique(y_val)]),
+    }
+
+    if method == "none":
+        info["reason"] = "CALIBRATION_METHOD is none."
+        return p_val_raw, p_test_raw, None, info
+
+    if method != "platt":
+        raise ValueError("CALIBRATION_METHOD must be 'platt' or 'none'. Isotonic was removed.")
+
+    if len(np.unique(y_val)) < 2:
+        info["reason"] = "Validation fold has fewer than two classes."
+        return p_val_raw, p_test_raw, None, info
+
+    if len(np.unique(y_val)) < num_classes:
+        info["reason"] = (
+            "Validation fold is missing at least one class; "
+            "multiclass Platt calibration skipped for this fold."
+        )
+        return p_val_raw, p_test_raw, None, info
+
+    x_val = np.log(np.clip(p_val_raw, 1e-7, 1.0))
+    x_test = np.log(np.clip(p_test_raw, 1e-7, 1.0))
+
+    lr = LogisticRegression(max_iter=2000, C=1e6, solver="lbfgs")
+    lr.fit(x_val, y_val)
+
+    p_val_cal_partial = lr.predict_proba(x_val)
+    p_test_cal_partial = lr.predict_proba(x_test)
+
+    p_val_cal = np.zeros((len(y_val), num_classes), dtype=np.float64)
+    p_test_cal = np.zeros((len(p_test_raw), num_classes), dtype=np.float64)
+
+    for j, cls in enumerate(lr.classes_):
+        p_val_cal[:, int(cls)] = p_val_cal_partial[:, j]
+        p_test_cal[:, int(cls)] = p_test_cal_partial[:, j]
+
+    info["applied"] = True
+    info["reason"] = "Multinomial Platt calibration applied."
+
+    return renormalize_proba(p_val_cal), renormalize_proba(p_test_cal), lr, info
+
+
+def choose_threshold(y_val, p_val, method="f2", task=None):
+    if len(np.unique(y_val)) < 2:
+        return 0.5
+
+    p_val = clip_prob(p_val)
+
+    precision, recall, thresholds = precision_recall_curve(y_val, p_val)
+    precision = precision[:-1]
+    recall = recall[:-1]
+
+    if len(thresholds) == 0:
+        return 0.5
+
+    beta = 2.0
+    scores = (1 + beta ** 2) * precision * recall / (
+        beta ** 2 * precision + recall + 1e-10
+    )
+    return float(thresholds[np.argmax(scores)])
+
+
+def choose_thresholds_ovr(y_val, p_val_proba, method, num_classes):
+    thresholds = np.full(num_classes, 0.5, dtype=np.float64)
+
+    for k in range(num_classes):
+        y_bin = (y_val == k).astype(int)
+        p_k = p_val_proba[:, k]
+
+        if len(np.unique(y_bin)) < 2:
+            thresholds[k] = 0.5
+        else:
+            thresholds[k] = choose_threshold(
+                y_val=y_bin,
+                p_val=p_k,
+                method="f2",
+                task="multi_ovr",
+            )
+
+    return thresholds
+
+
+def predict_ovr(p_proba, thresholds):
+    p_proba = renormalize_proba(p_proba)
+    margins = p_proba - thresholds[None, :]
+    return np.argmax(margins, axis=1)
+
+
+# ============================================================
+# BLOCK 11: METRICS
+# ============================================================
+
+def _safe_div(num, den, undefined=np.nan):
+    return float(num / den) if den > 0 else undefined
+
+
+def binary_clinical_metrics(y_true, y_pred, y_score):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    y_score = clip_prob(y_score)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    sens = _safe_div(tp, tp + fn)
+    spec = _safe_div(tn, tn + fp)
+    ppv = _safe_div(tp, tp + fp)
+    npv = _safe_div(tn, tn + fn)
+
+    if len(np.unique(y_true)) > 1:
+        auroc = roc_auc_score(y_true, y_score)
+    else:
+        auroc = np.nan
+
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "sensitivity_recall": sens,
+        "specificity": spec,
+        "precision_ppv": ppv,
+        "npv": npv,
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "auroc": auroc,
+        "brier": float(brier_score_loss(y_true, y_score)),
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn),
+        "prevalence": float(np.mean(y_true)),
+    }
+
+
+def boot_clinical_metrics(y_true, y_pred, y_score, n_boot, seed):
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+
+    keys = [
+        "accuracy",
+        "sensitivity_recall",
+        "specificity",
+        "precision_ppv",
+        "npv",
+        "f1",
+        "auroc",
+        "brier",
+    ]
+
+    boot = {k: [] for k in keys}
+
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        yt = y_true[idx]
+        yp = y_pred[idx]
+        ys = y_score[idx]
+
+        if len(np.unique(yt)) < 2:
+            continue
+
+        m = binary_clinical_metrics(yt, yp, ys)
+
+        for k in keys:
+            v = m[k]
+            if isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v):
+                boot[k].append(float(v))
+
+    out = {}
+    for k, values in boot.items():
+        if len(values) == 0:
+            out[k] = (np.nan, np.nan, np.nan)
+        else:
+            out[k] = (
+                float(np.mean(values)),
+                float(np.percentile(values, 2.5)),
+                float(np.percentile(values, 97.5)),
+            )
+
+    return out
+
+
+def multiclass_brier_normalized(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    num_classes: int,
+) -> float:
+    y_true = np.asarray(y_true, dtype=int)
+    y_proba = renormalize_proba(y_proba)
+    y_onehot = np.eye(num_classes, dtype=np.float64)[y_true]
+    return float(np.mean(np.mean((y_onehot - y_proba) ** 2, axis=1)))
+
+
+def multiclass_clinical_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: np.ndarray,
+    num_classes: int,
+) -> Dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    y_proba = renormalize_proba(y_proba)
+
+    out: Dict[str, Any] = {}
+
+    out["accuracy"] = float(accuracy_score(y_true, y_pred))
+    out["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
+    out["brier_multiclass_normalized"] = multiclass_brier_normalized(
+        y_true,
+        y_proba,
+        num_classes,
+    )
+
+    try:
+        out["nll_multiclass"] = float(log_loss(y_true, y_proba, labels=list(range(num_classes))))
+    except Exception:
+        out["nll_multiclass"] = np.nan
+
+    sens_list, spec_list, ppv_list, npv_list = [], [], [], []
+    f1_list, auroc_list, brier_list = [], [], []
+
+    for k in range(num_classes):
+        y_bin = (y_true == k).astype(int)
+        y_hat_bin = (y_pred == k).astype(int)
+        p_k = y_proba[:, k]
+
+        cm_k = confusion_matrix(y_bin, y_hat_bin, labels=[0, 1])
+        tn, fp, fn, tp = cm_k.ravel()
+
+        sens = _safe_div(tp, tp + fn)
+        spec = _safe_div(tn, tn + fp)
+        ppv = _safe_div(tp, tp + fp)
+        npv = _safe_div(tn, tn + fn)
+        f1_k = float(f1_score(y_bin, y_hat_bin, zero_division=0))
+
+        if len(np.unique(y_bin)) > 1:
+            auroc_k = roc_auc_score(y_bin, p_k)
+        else:
+            auroc_k = np.nan
+
+        brier_k = float(brier_score_loss(y_bin, clip_prob(p_k)))
+        prev_k = float(np.mean(y_bin))
+
+        out[f"sensitivity_recall_class{k}"] = sens
+        out[f"specificity_class{k}"] = spec
+        out[f"precision_ppv_class{k}"] = ppv
+        out[f"npv_class{k}"] = npv
+        out[f"f1_class{k}"] = f1_k
+        out[f"auroc_class{k}"] = auroc_k
+        out[f"brier_class{k}"] = brier_k
+        out[f"tp_class{k}"] = int(tp)
+        out[f"fp_class{k}"] = int(fp)
+        out[f"tn_class{k}"] = int(tn)
+        out[f"fn_class{k}"] = int(fn)
+        out[f"prevalence_class{k}"] = prev_k
+
+        sens_list.append(sens)
+        spec_list.append(spec)
+        ppv_list.append(ppv)
+        npv_list.append(npv)
+        f1_list.append(f1_k)
+        auroc_list.append(auroc_k)
+        brier_list.append(brier_k)
+
+    out["sensitivity_recall_macro"] = float(np.nanmean(sens_list))
+    out["specificity_macro"] = float(np.nanmean(spec_list))
+    out["precision_ppv_macro"] = float(np.nanmean(ppv_list))
+    out["npv_macro"] = float(np.nanmean(npv_list))
+    out["f1_macro"] = float(np.nanmean(f1_list))
+    out["brier_macro"] = float(np.nanmean(brier_list))
+
+    out["precision_macro"] = float(
+        precision_score(y_true, y_pred, average="macro", zero_division=0)
+    )
+    out["recall_macro"] = float(
+        recall_score(y_true, y_pred, average="macro", zero_division=0)
+    )
+
+    try:
+        y_bin_all = label_binarize(y_true, classes=list(range(num_classes)))
+        out["auroc_macro"] = float(
+            roc_auc_score(
+                y_bin_all,
+                y_proba,
+                average="macro",
+                multi_class="ovr",
+            )
+        )
+    except Exception:
+        out["auroc_macro"] = float(np.nanmean(auroc_list))
+
+    return out
+
+
+def boot_multiclass_clinical_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: np.ndarray,
+    num_classes: int,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Tuple[float, float, float]]:
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+
+    sample = multiclass_clinical_metrics(y_true, y_pred, y_proba, num_classes)
+
+    skip_prefixes = ("tp_class", "fp_class", "tn_class", "fn_class")
+    keys = [
+        k for k, v in sample.items()
+        if isinstance(v, (int, float, np.integer, np.floating))
+        and not k.startswith(skip_prefixes)
+    ]
+
+    boot = {k: [] for k in keys}
+
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        yt = y_true[idx]
+        yp = y_pred[idx]
+        ys = y_proba[idx]
+
+        if len(np.unique(yt)) < 2:
+            continue
+
+        m = multiclass_clinical_metrics(yt, yp, ys, num_classes)
+
+        for k in keys:
+            v = m.get(k, np.nan)
+            if isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v):
+                boot[k].append(float(v))
+
+    out = {}
+    for k, values in boot.items():
+        if len(values) == 0:
+            out[k] = (np.nan, np.nan, np.nan)
+        else:
+            out[k] = (
+                float(np.mean(values)),
+                float(np.percentile(values, 2.5)),
+                float(np.percentile(values, 97.5)),
+            )
+
+    return out
+
+
+def calibration_extras(y_true, y_score, n_bins=10):
+    y_true = np.asarray(y_true).astype(int)
+    y_score = clip_prob(y_score)
+
+    bins = np.linspace(0, 1, n_bins + 1)
+    idx = np.clip(np.digitize(y_score, bins) - 1, 0, n_bins - 1)
+
+    rows = []
+    ece = 0.0
+    mce = 0.0
+    n = len(y_true)
+
+    for b in range(n_bins):
+        mask = idx == b
+        count = int(mask.sum())
+
+        if count == 0:
+            continue
+
+        obs = float(y_true[mask].mean())
+        pred = float(y_score[mask].mean())
+        gap = abs(obs - pred)
+
+        ece += (count / n) * gap
+        mce = max(mce, gap)
+
+        rows.append({
+            "bin": b,
+            "p_lo": float(bins[b]),
+            "p_hi": float(bins[b + 1]),
+            "count": count,
+            "mean_pred": pred,
+            "obs_freq": obs,
+            "abs_gap": gap,
+        })
+
+    slope = np.nan
+    intercept = np.nan
+
+    try:
+        if len(np.unique(y_true)) > 1:
+            p = clip_prob(y_score)
+            logit = np.log(p / (1 - p))
+            lr = LogisticRegression(max_iter=1000)
+            lr.fit(logit.reshape(-1, 1), y_true)
+            slope = float(lr.coef_[0, 0])
+            intercept = float(lr.intercept_[0])
+    except Exception:
+        pass
+
+    return (
+        {
+            "ece": float(ece),
+            "mce": float(mce),
+            "calibration_slope": slope,
+            "calibration_intercept": intercept,
+        },
+        pd.DataFrame(rows),
+    )
+
+
+# ============================================================
+# BLOCK 12: PLOTS
+# ============================================================
+
+def task_display_name(task: str) -> str:
+    return TASK_CONFIGS.get(task, {}).get("display_name", task)
+
+
+def make_plot_title(task: str, n: int, cutoff: float, plot_name: str,
+                    class_name: Optional[str] = None) -> str:
+    label = plot_name if class_name is None else f"{plot_name} — {class_name}"
+    return f"{task_display_name(task)}\n{label} (N = {n}, PSA cutoff = {cutoff:g})"
+
+
+def _prepare_axes_array(axes):
+    if isinstance(axes, np.ndarray):
+        return axes.ravel().tolist()
+    return [axes]
+
+
+def plot_history(history_dict, save_path, title):
+    h = history_dict
+    candidates = [
+        ("loss", "val_loss", "Loss"),
+        ("accuracy", "val_accuracy", "Accuracy"),
+        ("auc", "val_auc", "AUROC"),
+    ]
+    panels = [(a, b, c) for a, b, c in candidates if a in h or b in h]
+
+    if not panels:
+        return pd.DataFrame()
+
+    fig, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(5.2 * len(panels), 4.2),
+        constrained_layout=True,
+    )
+    axes = _prepare_axes_array(axes)
+
+    rows = []
+
+    for ax, (train_key, val_key, ylabel) in zip(axes, panels):
+        if train_key in h:
+            xs = np.arange(1, len(h[train_key]) + 1)
+            ax.plot(xs, h[train_key], label=f"Training {ylabel}", color=PLOT_PALETTE["primary"])
+            for ep, v in zip(xs, h[train_key]):
+                rows.append({
+                    "epoch": int(ep),
+                    "metric": train_key,
+                    "split": "train",
+                    "value": float(v),
+                })
+
+        if val_key in h:
+            xs = np.arange(1, len(h[val_key]) + 1)
+            ax.plot(xs, h[val_key], label=f"Validation {ylabel}",
+                    color=PLOT_PALETTE["primary_dark"], linestyle="--")
+            for ep, v in zip(xs, h[val_key]):
+                rows.append({
+                    "epoch": int(ep),
+                    "metric": train_key,
+                    "split": "val",
+                    "value": float(v),
+                })
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return pd.DataFrame(rows)
+
+
+def plot_learning_dynamics_kfold(histories, save_path, title):
+    metric_names = ["loss", "accuracy", "auc"]
+    rows = []
+
+    for fold_i, h in enumerate(histories):
+        for metric in metric_names:
+            train_key = metric
+            val_key = f"val_{metric}"
+
+            for ep, v in enumerate(h.get(train_key, [])):
+                rows.append({
+                    "fold": fold_i,
+                    "epoch": ep + 1,
+                    "metric": metric,
+                    "split": "train",
+                    "value": float(v),
+                })
+
+            for ep, v in enumerate(h.get(val_key, [])):
+                rows.append({
+                    "fold": fold_i,
+                    "epoch": ep + 1,
+                    "metric": metric,
+                    "split": "val",
+                    "value": float(v),
+                })
+
+    dyn_df = pd.DataFrame(rows)
+    plot_learning_dynamics_from_df(dyn_df, save_path, title)
+    return dyn_df
+
+
+def plot_learning_dynamics_from_df(dyn_df: pd.DataFrame, save_path: str, title: str):
+    if dyn_df is None or len(dyn_df) == 0:
+        return
+
+    metric_label = {
+        "loss": "Loss",
+        "accuracy": "Accuracy",
+        "auc": "AUROC",
+    }
+
+    metrics = [m for m in ["loss", "accuracy", "auc"] if m in set(dyn_df["metric"].astype(str))]
+    if not metrics:
+        return
+
+    fig, axes = plt.subplots(
+        1,
+        len(metrics),
+        figsize=(5.2 * len(metrics), 4.3),
+        constrained_layout=True,
+    )
+    axes = _prepare_axes_array(axes)
+
+    for ax, metric in zip(axes, metrics):
+        sub = dyn_df[dyn_df["metric"] == metric].copy()
+
+        for fold_i in sorted(sub["fold"].dropna().unique()):
+            sf = sub[sub["fold"] == fold_i]
+            for split, ls, alpha in [("train", "-", 0.35), ("val", "--", 0.75)]:
+                ss = sf[sf["split"] == split]
+                if len(ss) == 0:
+                    continue
+                ax.plot(
+                    ss["epoch"],
+                    ss["value"],
+                    linestyle=ls,
+                    alpha=alpha,
+                    linewidth=1.1,
+                    label=f"Fold {int(fold_i)} {split.capitalize()}" if int(fold_i) < 4 else None,
+                )
+
+        val = sub[sub["split"] == "val"].copy()
+        if len(val) > 0:
+            grouped = val.groupby("epoch")["value"]
+            mean_v = grouped.mean()
+            std_v = grouped.std().fillna(0)
+            xs = mean_v.index.to_numpy()
+            ax.plot(xs, mean_v.to_numpy(), color="black", linewidth=2.2, label="Mean Validation")
+            ax.fill_between(
+                xs,
+                (mean_v - std_v).to_numpy(),
+                (mean_v + std_v).to_numpy(),
+                color="black",
+                alpha=0.12,
+                label="±1 SD",
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(metric_label.get(metric, metric.capitalize()))
+        ax.grid(alpha=0.3)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=7, ncol=2)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_roc(y_true, y_score, save_path, title):
+    if len(np.unique(y_true)) < 2:
+        return
+
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auroc = roc_auc_score(y_true, y_score)
+
+    fig, ax = plt.subplots(figsize=(5.6, 5.2), constrained_layout=True)
+    ax.plot(fpr, tpr, lw=2.2, color=PLOT_PALETTE["primary_dark"], label=f"AUROC = {auroc:.3f}")
+    ax.plot([0, 1], [0, 1], ls="--", color=PLOT_PALETTE["reference"], alpha=0.7)
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_roc_from_df(df, save_path, title):
+    if df is None or len(df) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(5.6, 5.2), constrained_layout=True)
+    ax.plot(df["fpr"], df["tpr"], lw=2.2, color=PLOT_PALETTE["primary_dark"])
+    ax.plot([0, 1], [0, 1], ls="--", color=PLOT_PALETTE["reference"], alpha=0.7)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.grid(alpha=0.3)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_confusion(cm, save_path, class_names, title):
+    cm = np.asarray(cm)
+
+    fig, ax = plt.subplots(figsize=(5.8, 5.0), constrained_layout=True)
+
+    im = ax.imshow(cm, cmap="Blues")
+
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=35, ha="right")
+    ax.set_yticklabels(class_names)
+
+    threshold = cm.max() / 2.0 if cm.max() > 0 else 0
+
+    for i, j in np.ndindex(cm.shape):
+        ax.text(
+            j,
+            i,
+            str(cm[i, j]),
+            ha="center",
+            va="center",
+            color="white" if cm[i, j] > threshold else "black",
+        )
+
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=14)
+    ax.set_xlabel("Predicted Class")
+    ax.set_ylabel("True Class")
+
+    cbar = fig.colorbar(
+        im,
+        ax=ax,
+        location="right",
+        pad=0.08,
+        shrink=0.82,
+        fraction=0.046,
+    )
+    cbar.ax.set_ylabel("Count", rotation=270, labelpad=16)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_confusion_from_long_df(df, save_path, class_names, title):
+    if df is None or len(df) == 0:
+        return
+
+    ncls = len(class_names)
+    cm = np.zeros((ncls, ncls), dtype=int)
+
+    for _, row in df.iterrows():
+        i = int(row["true_class_index"])
+        j = int(row["pred_class_index"])
+        if i < ncls and j < ncls:
+            cm[i, j] = int(row["count"])
+
+    plot_confusion(cm, save_path, class_names, title)
+
+
+def plot_calibration(y_true, y_score, save_path, title):
+    if len(np.unique(y_true)) < 2:
+        return
+
+    _, calib_df = calibration_extras(y_true, y_score)
+    plot_calibration_from_df(calib_df, save_path, title)
+
+
+def plot_calibration_from_df(calib_df, save_path, title):
+    fig, ax = plt.subplots(figsize=(5.3, 5.2), constrained_layout=True)
+    ax.plot(
+        [0, 1],
+        [0, 1],
+        ls="--",
+        color=PLOT_PALETTE["reference"],
+        alpha=0.7,
+        label="Perfect Calibration",
+    )
+
+    if calib_df is not None and len(calib_df) > 0:
+        ax.plot(
+            calib_df["mean_pred"],
+            calib_df["obs_freq"],
+            "o-",
+            lw=2.2,
+            color=PLOT_PALETTE["calibration"],
+            label="Model",
+        )
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Mean Predicted Probability")
+    ax.set_ylabel("Observed Event Frequency")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_feature_importance(fi_df, save_path, title, metric="auroc"):
+    if fi_df is None or len(fi_df) == 0:
+        return
+
+    df = fi_df.copy()
+    metric = str(metric).lower()
+
+    if metric == "auroc":
+        candidates = [
+            ("auroc_drop", "AUROC Drop"),
+            ("auroc_macro_drop", "Macro AUROC Drop"),
+        ]
+    elif metric == "brier":
+        candidates = [
+            ("brier_increase", "Brier Increase"),
+        ]
+    else:
+        raise ValueError(f"Unknown feature-importance metric: {metric}")
+
+    val_col = None
+    xlab = None
+
+    for col, label in candidates:
+        if col in df.columns:
+            val_col = col
+            xlab = label
+            break
+
+    if val_col is None:
+        return
+
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+    df = df.dropna(subset=[val_col])
+
+    if len(df) == 0:
+        return
+
+    df = df.sort_values(val_col, ascending=False)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8), constrained_layout=True)
+
+    ax.barh(df["feature"], df[val_col], color=PLOT_PALETTE["primary"])
+    ax.axvline(0, color=PLOT_PALETTE["reference"], linewidth=1.0, alpha=0.8)
+
+    ax.invert_yaxis()
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("Feature")
+    ax.grid(axis="x", alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _sample_label_for_attention(i, risk, y_true, y_pred, class_names):
+    t = class_names[int(y_true[i])] if y_true is not None else "NA"
+    p = class_names[int(y_pred[i])] if y_pred is not None else "NA"
+    return f"Sample {int(i)} | True: {t} | Pred: {p} | Risk: {risk[i]:.2f}"
+
+
+def plot_attention_examples(
+    attn_model,
+    X_scaled,
+    save_path,
+    title,
+    risk_scores: np.ndarray,
+    meta: Optional[pd.DataFrame] = None,
+    y_true: Optional[np.ndarray] = None,
+    y_pred: Optional[np.ndarray] = None,
+    proba: Optional[np.ndarray] = None,
+    class_names: Optional[List[str]] = None,
+):
+    if attn_model is None or len(X_scaled) < 2:
+        return pd.DataFrame()
+
+    class_names = class_names or []
+    risk = np.asarray(risk_scores, dtype=float).ravel()
+
+    n_examples = min(6, len(X_scaled) // 2)
+    if n_examples < 1:
+        return pd.DataFrame()
+
+    high_idx = np.argsort(risk)[-n_examples:][::-1]
+    low_idx = np.argsort(risk)[:n_examples]
+
+    a_high = predict_model(attn_model, X_scaled[high_idx]).squeeze(-1)
+    a_low = predict_model(attn_model, X_scaled[low_idx]).squeeze(-1)
+
+    combined = np.concatenate([a_high.ravel(), a_low.ravel()])
+    vmax = float(np.quantile(combined, 0.95)) if len(combined) else None
+    if vmax is not None and vmax <= 0:
+        vmax = None
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 7.2), constrained_layout=True)
+    rows = []
+
+    for ax, mat, idxs, ylabel, group in zip(
+        axes,
+        [a_high, a_low],
+        [high_idx, low_idx],
+        ["High Predicted Risk Samples", "Low Predicted Risk Samples"],
+        ["high", "low"],
+    ):
+        im = ax.imshow(
+            mat,
+            aspect="auto",
+            cmap=ATTENTION_CMAP,
+            vmin=0,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+
+        ax.set_xlabel("Sequence Position")
+        ax.set_ylabel(ylabel)
+        ax.set_yticks(np.arange(len(idxs)))
+
+        if y_true is not None and y_pred is not None and class_names:
+            ax.set_yticklabels([
+                _sample_label_for_attention(i, risk, y_true, y_pred, class_names)
+                for i in idxs
+            ], fontsize=7)
+        else:
+            ax.set_yticklabels([f"Sample {int(i)}" for i in idxs], fontsize=8)
+
+        for r, original_idx in enumerate(idxs):
+            base = {
+                "risk_group": group,
+                "display_row": int(r),
+                "sample_index": int(original_idx),
+                "risk_score": float(risk[original_idx]),
+            }
+
+            if meta is not None and "patient_id" in meta.columns:
+                base["patient_id"] = meta.iloc[original_idx]["patient_id"]
+
+            if y_true is not None:
+                base["y_true"] = int(y_true[original_idx])
+            if y_pred is not None:
+                base["y_pred"] = int(y_pred[original_idx])
+
+            if proba is not None:
+                p = np.asarray(proba)
+                if p.ndim == 1:
+                    base["p_event"] = float(p[original_idx])
+                elif p.ndim == 2:
+                    for k in range(p.shape[1]):
+                        cname = _class_col_name(
+                            class_names[k] if k < len(class_names) else f"class{k}"
+                        )
+                        base[f"p_{cname}"] = float(p[original_idx, k])
+
+            for t in range(mat.shape[1]):
+                row = base.copy()
+                row["time_step"] = int(t)
+                row["attention_weight"] = float(mat[r, t])
+                rows.append(row)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    cbar = fig.colorbar(im, ax=axes, location="right", pad=0.02, shrink=0.92)
+    cbar.set_label("Attention Weight")
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return pd.DataFrame(rows)
+
+
+def plot_attention_examples_from_df(df, save_path, title):
+    if df is None or len(df) == 0:
+        return
+
+    groups = [g for g in ["high", "low"] if g in set(df["risk_group"].astype(str))]
+    if not groups:
+        return
+
+    fig, axes = plt.subplots(
+        len(groups),
+        1,
+        figsize=(13, 3.8 * len(groups)),
+        constrained_layout=True,
+    )
+    axes = _prepare_axes_array(axes)
+    im = None
+
+    for ax, group in zip(axes, groups):
+        sub = df[df["risk_group"] == group].copy()
+        pivot = sub.pivot_table(
+            index="display_row",
+            columns="time_step",
+            values="attention_weight",
+            aggfunc="mean",
+        ).sort_index()
+
+        im = ax.imshow(
+            pivot.to_numpy(),
+            aspect="auto",
+            cmap=ATTENTION_CMAP,
+            interpolation="nearest",
+        )
+        ax.set_xlabel("Sequence Position")
+        ax.set_ylabel(f"{group.capitalize()} Risk Samples")
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes, location="right", pad=0.02, shrink=0.92)
+        cbar.set_label("Attention Weight")
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def attention_long_df(
+    attention_weights: np.ndarray,
+    meta: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: Optional[np.ndarray],
+    proba: Optional[np.ndarray],
+    class_names: List[str],
+) -> pd.DataFrame:
+    attn = np.asarray(attention_weights)
+    if attn.ndim == 3:
+        attn = attn.squeeze(-1)
+
+    rows = []
+    meta = meta.reset_index(drop=True)
+
+    for i in range(attn.shape[0]):
+        base = {
+            "sample_index": int(i),
+            "patient_id": meta.loc[i, "patient_id"] if "patient_id" in meta.columns else i,
+            "y_true": int(y_true[i]),
+        }
+
+        if y_pred is not None:
+            base["y_pred"] = int(y_pred[i])
+
+        if proba is not None:
+            p = np.asarray(proba)
+            if p.ndim == 1:
+                base["p_event"] = float(p[i])
+            elif p.ndim == 2:
+                for k in range(p.shape[1]):
+                    cname = _class_col_name(class_names[k] if k < len(class_names) else f"class{k}")
+                    base[f"p_{cname}"] = float(p[i, k])
+
+        for t in range(attn.shape[1]):
+            row = base.copy()
+            row["time_step"] = int(t)
+            row["attention_weight"] = float(attn[i, t])
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def attention_summary_tables(
+    attention_weights: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: Optional[np.ndarray],
+    class_names: List[str],
+) -> Dict[str, pd.DataFrame]:
+    attn = np.asarray(attention_weights)
+    if attn.ndim == 3:
+        attn = attn.squeeze(-1)
+
+    y_true = np.asarray(y_true, dtype=int)
+    summaries = {}
+
+    def _summarize(group_values, group_label_map, group_col):
+        rows = []
+        for gv in sorted(np.unique(group_values), key=lambda x: str(x)):
+            mask = group_values == gv
+            mat = attn[mask]
+            if len(mat) == 0:
+                continue
+
+            for t in range(mat.shape[1]):
+                vals = mat[:, t]
+                mean_v = float(np.mean(vals))
+                std_v = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+                se_v = std_v / math.sqrt(len(vals)) if len(vals) > 0 else np.nan
+                ci = 1.96 * se_v if np.isfinite(se_v) else np.nan
+
+                rows.append({
+                    group_col: gv,
+                    "group_label": group_label_map.get(gv, str(gv)),
+                    "time_step": int(t),
+                    "n_samples": int(len(vals)),
+                    "mean_attention": mean_v,
+                    "std_attention": std_v,
+                    "ci95_low": mean_v - ci if np.isfinite(ci) else np.nan,
+                    "ci95_high": mean_v + ci if np.isfinite(ci) else np.nan,
+                })
+
+        return pd.DataFrame(rows)
+
+    true_map = {
+        k: class_names[k] if k < len(class_names) else f"Class {k}"
+        for k in np.unique(y_true)
+    }
+    summaries["attention_summary_by_true_class"] = _summarize(
+        y_true,
+        true_map,
+        "true_class",
+    )
+
+    if y_pred is not None:
+        y_pred = np.asarray(y_pred, dtype=int)
+        pred_map = {
+            k: class_names[k] if k < len(class_names) else f"Class {k}"
+            for k in np.unique(y_pred)
+        }
+        summaries["attention_summary_by_predicted_class"] = _summarize(
+            y_pred,
+            pred_map,
+            "predicted_class",
+        )
+
+        correctness = np.where(y_pred == y_true, "Correct", "Incorrect")
+        summaries["attention_summary_by_correctness"] = _summarize(
+            correctness,
+            {"Correct": "Correct Predictions", "Incorrect": "Incorrect Predictions"},
+            "correctness",
+        )
+
+    return summaries
+
+
+def plot_attention_summary_df(df, save_path, title, group_col):
+    if df is None or len(df) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(8.4, 5.2), constrained_layout=True)
+
+    for group_label, sub in df.groupby("group_label", sort=False):
+        sub = sub.sort_values("time_step")
+        xs = sub["time_step"].to_numpy() + 1
+        max_pos = int(df["time_step"].max()) + 1
+        ax.set_xticks(np.arange(1, max_pos + 1))
+        mean = sub["mean_attention"].to_numpy()
+        lo = sub["ci95_low"].to_numpy()
+        hi = sub["ci95_high"].to_numpy()
+
+        ax.plot(xs, mean, marker="o", linewidth=2.0, label=str(group_label))
+        if np.isfinite(lo).all() and np.isfinite(hi).all():
+            ax.fill_between(xs, lo, hi, alpha=0.12)
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Sequence Position")
+    ax.set_ylabel("Mean Attention Weight")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_psa_trajectories(X_unscaled, probs, save_path, title):
+    if len(X_unscaled) < 4:
+        return pd.DataFrame()
+
+    risk = np.asarray(probs)
+    if risk.ndim == 2:
+        risk = 1.0 - risk[:, 0]
+    risk = risk.ravel()
+
+    n_show = min(6, len(X_unscaled) // 2)
+    sorted_idx = np.argsort(risk)
+    low_idx = sorted_idx[:n_show]
+    high_idx = sorted_idx[-n_show:][::-1]
+
+    fig, ax = plt.subplots(figsize=(10, 5.4), constrained_layout=True)
+    rows = []
+
+    for group, idxs, color, label in [
+        ("low", low_idx, PLOT_PALETTE["primary_light"], "Low Predicted Risk"),
+        ("high", high_idx, PLOT_PALETTE["primary_dark"], "High Predicted Risk"),
+    ]:
+        for k, i in enumerate(idxs):
+            ax.plot(
+                X_unscaled[i, :, 0],
+                marker="o",
+                color=color,
+                alpha=0.78,
+                linewidth=1.8,
+                label=label if k == 0 else None,
+            )
+
+            for t in range(X_unscaled.shape[1]):
+                rows.append({
+                    "risk_group": group,
+                    "sample_index": int(i),
+                    "time_step": int(t),
+                    "risk_score": float(risk[i]),
+                    "psa_feature_value": float(X_unscaled[i, t, 0]),
+                })
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Sequence Position")
+    ax.set_ylabel("PSA Feature Value")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return pd.DataFrame(rows)
+
+
+def plot_psa_trajectory_examples_from_df(df, save_path, title):
+    if df is None or len(df) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 5.4), constrained_layout=True)
+
+    for group, sub in df.groupby("risk_group"):
+        color = PLOT_PALETTE["primary_dark"] if group == "high" else PLOT_PALETTE["primary_light"]
+        label = "High Predicted Risk" if group == "high" else "Low Predicted Risk"
+
+        for k, (sample_idx, ss) in enumerate(sub.groupby("sample_index")):
+            ss = ss.sort_values("time_step")
+            ax.plot(
+                ss["time_step"],
+                ss["psa_feature_value"],
+                marker="o",
+                color=color,
+                alpha=0.78,
+                linewidth=1.8,
+                label=label if k == 0 else None,
+            )
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Sequence Position")
+    ax.set_ylabel("PSA Feature Value")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# BLOCK 13: FEATURE IMPORTANCE
+# ============================================================
+
+def permutation_importance_binary(
+    model,
+    X_test_scaled,
+    y_test,
+    feature_names,
+    n_repeats,
+    seed,
+):
+    if len(np.unique(y_test)) < 2:
+        return pd.DataFrame()
+
+    rng = np.random.RandomState(seed)
+
+    p_base = predict_model(model, X_test_scaled).ravel()
+    base_auroc = roc_auc_score(y_test, p_base)
+
+    rows = []
+
+    for j, name in enumerate(feature_names):
+        auroc_scores = []
+
+        for _ in range(n_repeats):
+            X_perm = X_test_scaled.copy()
+            perm_idx = rng.permutation(len(X_perm))
+            X_perm[:, :, j] = X_perm[perm_idx, :, j]
+
+            p_perm = predict_model(model, X_perm).ravel()
+            auroc_scores.append(roc_auc_score(y_test, p_perm))
+
+        rows.append({
+            "feature": name,
+            "base_auroc": float(base_auroc),
+            "permuted_auroc": float(np.mean(auroc_scores)),
+            "auroc_drop": float(base_auroc - np.mean(auroc_scores)),
+            "n_repeats": int(n_repeats),
+            "importance_type": "raw_model_permutation",
+        })
+
+    return pd.DataFrame(rows).sort_values("auroc_drop", ascending=False)
+
+
+def permutation_importance_multiclass(
+    model,
+    X_test_scaled,
+    y_test,
+    feature_names,
+    num_classes,
+    n_repeats,
+    seed,
+):
+    if len(np.unique(y_test)) < 2:
+        return pd.DataFrame()
+
+    rng = np.random.RandomState(seed)
+
+    p_base = predict_model(model, X_test_scaled)
+    y_base = np.argmax(p_base, axis=1)
+
+    base_m = multiclass_clinical_metrics(
+        y_true=y_test,
+        y_pred=y_base,
+        y_proba=p_base,
+        num_classes=num_classes,
+    )
+
+    base_auroc = base_m.get("auroc_macro", np.nan)
+    base_brier = base_m.get("brier_multiclass_normalized", np.nan)
+
+    rows = []
+
+    for j, name in enumerate(feature_names):
+        auroc_scores = []
+        brier_scores = []
+
+        for _ in range(n_repeats):
+            X_perm = X_test_scaled.copy()
+            perm_idx = rng.permutation(len(X_perm))
+            X_perm[:, :, j] = X_perm[perm_idx, :, j]
+
+            p_perm = predict_model(model, X_perm)
+            y_perm = np.argmax(p_perm, axis=1)
+
+            m_perm = multiclass_clinical_metrics(
+                y_true=y_test,
+                y_pred=y_perm,
+                y_proba=p_perm,
+                num_classes=num_classes,
+            )
+
+            auroc_scores.append(m_perm.get("auroc_macro", np.nan))
+            brier_scores.append(m_perm.get("brier_multiclass_normalized", np.nan))
+
+        mean_auroc = float(np.nanmean(auroc_scores))
+        mean_brier = float(np.nanmean(brier_scores))
+
+        rows.append({
+            "feature": name,
+            "base_auroc_macro": float(base_auroc),
+            "permuted_auroc_macro": mean_auroc,
+            "auroc_macro_drop": float(base_auroc - mean_auroc) if np.isfinite(base_auroc) else np.nan,
+            "base_brier_multiclass_normalized": float(base_brier),
+            "permuted_brier_multiclass_normalized": mean_brier,
+            "brier_increase": float(mean_brier - base_brier) if np.isfinite(base_brier) else np.nan,
+            "n_repeats": int(n_repeats),
+            "importance_type": "raw_model_permutation",
+        })
+
+    return pd.DataFrame(rows).sort_values("auroc_macro_drop", ascending=False)
+
+
+# ============================================================
+# BLOCK 14: EXCEL, RAW PLOT DATA, AND SUMMARY HELPERS
+# ============================================================
+
+def _sanitize_name(name: Any) -> str:
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_")
+    return s[:120] if s else "unnamed"
+
+
+def _class_col_name(name: str) -> str:
+    return _sanitize_name(name).replace(".", "_").replace("-", "_")
+
+
+def _unique_sheet_name(base: str, used: set) -> str:
+    base = str(base)[:31] or "sheet"
+    sheet = base
+    k = 1
+
+    while sheet in used:
+        suffix = f"_{k}"
+        sheet = base[:31 - len(suffix)] + suffix
+        k += 1
+
+    used.add(sheet)
+    return sheet
+
+
+def save_plot_data_xlsx(plot_data, save_path):
+    if not SAVE_PLOT_DATA_EXCEL:
+        return
+
+    try:
+        with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+            used = set()
+
+            for name, df in plot_data.items():
+                if df is None or len(df) == 0:
+                    continue
+
+                if not isinstance(df, pd.DataFrame):
+                    df = pd.DataFrame(df)
+
+                safe_name = _sanitize_name(name)
+
+                if len(df) <= EXCEL_MAX_ROWS or not EXCEL_CHUNK_LONG_TABLES:
+                    sheet = _unique_sheet_name(safe_name[:31], used)
+                    df.iloc[:EXCEL_MAX_ROWS].to_excel(writer, sheet_name=sheet, index=False)
+                else:
+                    n_chunks = int(math.ceil(len(df) / EXCEL_MAX_ROWS))
+                    for c in range(n_chunks):
+                        start = c * EXCEL_MAX_ROWS
+                        end = min((c + 1) * EXCEL_MAX_ROWS, len(df))
+                        chunk = df.iloc[start:end]
+                        suffix = f"_{c + 1}"
+                        sheet_base = safe_name[:31 - len(suffix)] + suffix
+                        sheet = _unique_sheet_name(sheet_base, used)
+                        chunk.to_excel(writer, sheet_name=sheet, index=False)
+
+    except ImportError:
+        folder = save_path.replace(".xlsx", "_csv")
+        os.makedirs(folder, exist_ok=True)
+
+        for name, df in plot_data.items():
+            if df is not None and len(df) > 0:
+                pd.DataFrame(df).to_csv(
+                    os.path.join(folder, f"{_sanitize_name(name)}.csv"),
+                    index=False,
+                )
+
+
+def save_plot_data_bundle(
+    plot_data: Dict[str, pd.DataFrame],
+    save_dir: str,
+    prefix: str,
+    arrays: Optional[Dict[str, np.ndarray]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    raw_dir = os.path.join(save_dir, "plot_data_raw", _sanitize_name(prefix))
+    os.makedirs(raw_dir, exist_ok=True)
+
+    manifest = []
+    excel_data = {}
+
+    for name, df in plot_data.items():
+        if df is None:
+            continue
+
+        if not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                continue
+
+        if len(df) == 0:
+            continue
+
+        safe = _sanitize_name(name)
+        csv_path = os.path.join(raw_dir, f"{safe}.csv")
+        df.to_csv(csv_path, index=False)
+
+        manifest.append({
+            "name": name,
+            "file": os.path.basename(csv_path),
+            "rows": int(len(df)),
+            "columns": int(df.shape[1]),
+            "included_in_excel": bool(SAVE_PLOT_DATA_EXCEL),
+        })
+
+        excel_data[name] = df
+
+    if arrays:
+        clean_arrays = {}
+
+        for k, v in arrays.items():
+            if v is None:
+                continue
+            arr = np.asarray(v)
+            if arr.dtype == object:
+                continue
+            clean_arrays[_sanitize_name(k)] = arr
+
+        if clean_arrays:
+            npz_path = os.path.join(raw_dir, "arrays.npz")
+            np.savez_compressed(npz_path, **clean_arrays)
+
+            manifest.append({
+                "name": "arrays",
+                "file": "arrays.npz",
+                "rows": None,
+                "columns": None,
+                "included_in_excel": False,
+            })
+
+    pd.DataFrame(manifest).to_csv(
+        os.path.join(raw_dir, "manifest.csv"),
+        index=False,
+    )
+
+    if metadata is not None:
+        save_json(metadata, os.path.join(raw_dir, "metadata.json"))
+
+    if excel_data and SAVE_PLOT_DATA_EXCEL:
+        save_plot_data_xlsx(
+            excel_data,
+            os.path.join(save_dir, f"plotdata_{_sanitize_name(prefix)}.xlsx"),
+        )
+
+
+def make_split_assignment_df(test_pids, folds) -> pd.DataFrame:
+    rows = []
+
+    for pid in test_pids:
+        rows.append({
+            "patient_id": pid,
+            "fold": np.nan,
+            "role": "test",
+        })
+
+    for fold_idx, (tr, va) in enumerate(folds):
+        for pid in tr:
+            rows.append({
+                "patient_id": pid,
+                "fold": int(fold_idx),
+                "role": "train",
+            })
+
+        for pid in va:
+            rows.append({
+                "patient_id": pid,
+                "fold": int(fold_idx),
+                "role": "val",
+            })
+
+    return pd.DataFrame(rows)
+
+
+def confusion_to_long_df(cm: np.ndarray, class_names: List[str]) -> pd.DataFrame:
+    rows = []
+    cm = np.asarray(cm)
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            rows.append({
+                "true_class_index": int(i),
+                "pred_class_index": int(j),
+                "true_class": class_names[i] if i < len(class_names) else f"class{i}",
+                "pred_class": class_names[j] if j < len(class_names) else f"class{j}",
+                "count": int(cm[i, j]),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def make_binary_prediction_frame(
+    meta: pd.DataFrame,
+    y_true: np.ndarray,
+    p_raw: Optional[np.ndarray],
+    p_cal: Optional[np.ndarray],
+    threshold: Optional[float],
+    fold: Optional[int],
+    split: str,
+    y_pred: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    df = meta.copy().reset_index(drop=True)
+    df.insert(0, "split", split)
+    df.insert(0, "fold", fold if fold is not None else np.nan)
+
+    df["y_true"] = np.asarray(y_true, dtype=int)
+
+    if p_raw is not None:
+        df["p_raw"] = np.asarray(p_raw, dtype=float)
+    if p_cal is not None:
+        df["p_calibrated"] = np.asarray(p_cal, dtype=float)
+    if threshold is not None:
+        df["threshold"] = float(threshold)
+    if y_pred is not None:
+        df["y_pred"] = np.asarray(y_pred, dtype=int)
+
+    return df
+
+
+def make_multiclass_prediction_frame(
+    meta: pd.DataFrame,
+    y_true: np.ndarray,
+    p_raw: Optional[np.ndarray],
+    p_cal: Optional[np.ndarray],
+    thresholds: Optional[np.ndarray],
+    fold: Optional[int],
+    split: str,
+    class_names: List[str],
+    y_pred: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    df = meta.copy().reset_index(drop=True)
+    df.insert(0, "split", split)
+    df.insert(0, "fold", fold if fold is not None else np.nan)
+
+    df["y_true"] = np.asarray(y_true, dtype=int)
+
+    if y_pred is not None:
+        df["y_pred"] = np.asarray(y_pred, dtype=int)
+
+    if p_raw is not None:
+        p_raw = np.asarray(p_raw, dtype=float)
+        for k in range(p_raw.shape[1]):
+            cname = _class_col_name(class_names[k] if k < len(class_names) else f"class{k}")
+            df[f"p_raw_{cname}"] = p_raw[:, k]
+
+    if p_cal is not None:
+        p_cal = np.asarray(p_cal, dtype=float)
+        for k in range(p_cal.shape[1]):
+            cname = _class_col_name(class_names[k] if k < len(class_names) else f"class{k}")
+            df[f"p_calibrated_{cname}"] = p_cal[:, k]
+
+    if thresholds is not None:
+        thresholds = np.asarray(thresholds, dtype=float)
+        for k, thr in enumerate(thresholds):
+            cname = _class_col_name(class_names[k] if k < len(class_names) else f"class{k}")
+            df[f"ovr_threshold_{cname}"] = float(thr)
+
+    return df
+
+
+def sequence_features_long_df(
+    X_unscaled: np.ndarray,
+    meta: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: Optional[np.ndarray],
+    feature_names: List[str],
+    proba: Optional[np.ndarray],
+    class_names: List[str],
+) -> pd.DataFrame:
+    rows = []
+    meta = meta.reset_index(drop=True)
+    X_unscaled = np.asarray(X_unscaled)
+
+    for i in range(X_unscaled.shape[0]):
+        base = {
+            "sample_index": int(i),
+            "patient_id": meta.loc[i, "patient_id"] if "patient_id" in meta.columns else i,
+            "y_true": int(y_true[i]),
+        }
+
+        if y_pred is not None:
+            base["y_pred"] = int(y_pred[i])
+
+        if proba is not None:
+            p = np.asarray(proba)
+            if p.ndim == 1:
+                base["p_event"] = float(p[i])
+            elif p.ndim == 2:
+                for k in range(p.shape[1]):
+                    cname = _class_col_name(class_names[k] if k < len(class_names) else f"class{k}")
+                    base[f"p_{cname}"] = float(p[i, k])
+
+        for t in range(X_unscaled.shape[1]):
+            row = base.copy()
+            row["time_step"] = int(t)
+            for j, fname in enumerate(feature_names):
+                row[fname] = float(X_unscaled[i, t, j])
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def ci_string(v):
+    m, lo, hi = v
+    if not np.isfinite(m):
+        return "NA"
+    return f"{m:.3f} ({lo:.3f}-{hi:.3f})"
+
+
+def flatten_binary_result(r):
+    row = {
+        "task": r["task"],
+        "experiment_name": task_display_name(r["task"]),
+        "n": r["n"],
+        "cutoff": r["cutoff"],
+        "n_splits": r.get("n_splits", N_SPLITS),
+        "imbalance_method": r["imbalance_method"],
+        "threshold_method": r["threshold_method"],
+        "threshold": r.get("threshold", np.nan),
+        "calibration_method": r.get("calibration_method", np.nan),
+        "raw_patients": r["audit"]["global"]["raw_patients"],
+        "patients_with_min_len": r["audit"]["global"]["patients_with_min_len"],
+        "eligible_patients": r["audit"]["global"]["eligible_patients"],
+        "global_positive": r["audit"]["global"].get("positive", np.nan),
+        "global_negative": r["audit"]["global"].get("negative", np.nan),
+        "global_prevalence": r["audit"]["global"].get("prevalence", np.nan),
+    }
+
+    for k, v in r.get("metrics_point", {}).items():
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            row[k] = v
+
+    for k, v in r.get("metrics_boot", {}).items():
+        m, lo, hi = v
+        row[f"{k}_mean"] = m
+        row[f"{k}_ci_lo"] = lo
+        row[f"{k}_ci_hi"] = hi
+        row[f"{k}_ci"] = ci_string(v)
+
+    for k, v in r.get("calibration", {}).items():
+        row[k] = v
+
+    for k, v in r.get("fold_metrics_summary", {}).items():
+        row[f"fold_{k}_mean"] = v.get("mean", np.nan)
+        row[f"fold_{k}_std"] = v.get("std", np.nan)
+
+    return row
+
+
+def flatten_multi_result(r):
+    row = {
+        "task": r["task"],
+        "experiment_name": task_display_name(r["task"]),
+        "n": r["n"],
+        "cutoff": r["cutoff"],
+        "n_splits": r.get("n_splits", N_SPLITS),
+        "imbalance_method": r["imbalance_method"],
+        "threshold_method": r.get("threshold_method", THRESHOLD_METHOD),
+        "calibration_method": r.get("calibration_method", np.nan),
+        "raw_patients": r["audit"]["global"]["raw_patients"],
+        "patients_with_min_len": r["audit"]["global"]["patients_with_min_len"],
+        "eligible_patients": r["audit"]["global"]["eligible_patients"],
+        "class_0": r["audit"]["global"].get("class_0", np.nan),
+        "class_1": r["audit"]["global"].get("class_1", np.nan),
+        "class_2": r["audit"]["global"].get("class_2", np.nan),
+    }
+
+    for k, v in r.get("metrics_point", {}).items():
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            row[k] = v
+
+    for k, v in r.get("metrics_boot", {}).items():
+        m, lo, hi = v
+        row[f"{k}_mean"] = m
+        row[f"{k}_ci_lo"] = lo
+        row[f"{k}_ci_hi"] = hi
+        row[f"{k}_ci"] = ci_string(v)
+
+    if "ovr_thresholds" in r:
+        for k, t in enumerate(r["ovr_thresholds"]):
+            row[f"ovr_threshold_class{k}"] = float(t)
+
+    for cls_key, cal in r.get("calibration_per_class", {}).items():
+        for cal_name, cal_value in cal.items():
+            row[f"calibration_{cls_key}_{cal_name}"] = cal_value
+
+    for k, v in r.get("fold_metrics_summary", {}).items():
+        row[f"fold_{k}_mean"] = v.get("mean", np.nan)
+        row[f"fold_{k}_std"] = v.get("std", np.nan)
+
+    return row
+
+
+def write_master_workbook(results, out_xlsx, num_classes):
+    if num_classes == 2:
+        summary = pd.DataFrame([flatten_binary_result(r) for r in results])
+    else:
+        summary = pd.DataFrame([flatten_multi_result(r) for r in results])
+
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="summary", index=False)
+
+        cm_rows = []
+        for r in results:
+            if "test_confusion" not in r:
+                continue
+
+            cm = np.array(r["test_confusion"])
+            row = {
+                "task": r["task"],
+                "experiment_name": task_display_name(r["task"]),
+                "n": r["n"],
+                "cutoff": r["cutoff"],
+            }
+
+            if num_classes == 2:
+                row.update({
+                    "TN": int(cm[0, 0]),
+                    "FP": int(cm[0, 1]),
+                    "FN": int(cm[1, 0]),
+                    "TP": int(cm[1, 1]),
+                    "threshold": r.get("threshold", np.nan),
+                })
+            else:
+                for i in range(cm.shape[0]):
+                    for j in range(cm.shape[1]):
+                        row[f"true_{i}_pred_{j}"] = int(cm[i, j])
+
+            cm_rows.append(row)
+
+        if cm_rows:
+            pd.DataFrame(cm_rows).to_excel(writer, sheet_name="confusion", index=False)
+
+        fi_rows = []
+        for r in results:
+            if "feature_importance" in r:
+                fi = pd.DataFrame(r["feature_importance"])
+                fi["task"] = r["task"]
+                fi["experiment_name"] = task_display_name(r["task"])
+                fi["n"] = r["n"]
+                fi["cutoff"] = r["cutoff"]
+                fi_rows.append(fi)
+
+        if fi_rows:
+            pd.concat(fi_rows, ignore_index=True).to_excel(
+                writer,
+                sheet_name="feature_importance",
+                index=False,
+            )
+
+        leak_rows = []
+        for r in results:
+            if "leakage_verification" in r:
+                lr = r["leakage_verification"]
+                leak_rows.append({
+                    "task": r["task"],
+                    "experiment_name": task_display_name(r["task"]),
+                    "n": r["n"],
+                    "cutoff": r["cutoff"],
+                    "all_ok": lr["all_ok"],
+                    "n_test": lr["n_test"],
+                    "n_folds": lr["n_folds"],
+                })
+
+        if leak_rows:
+            pd.DataFrame(leak_rows).to_excel(writer, sheet_name="leakage_check", index=False)
+
+    return summary
+
+
+# ============================================================
+# BLOCK 15: PRINTING AND SMALL RUNNER HELPERS
+# ============================================================
+
+def class_counts_ok(y, num_classes):
+    if len(y) == 0:
+        return False
+
+    vals, counts = np.unique(y, return_counts=True)
+
+    if len(vals) < num_classes:
+        return False
+
+    return bool(np.min(counts) >= MIN_CLASS_COUNT_TO_TRAIN)
+
+
+def _summarize_fold_metric_list(values):
+    arr = np.array([
+        v for v in values
+        if v is not None and isinstance(v, (int, float, np.integer, np.floating))
+        and np.isfinite(v)
+    ])
+
+    if len(arr) == 0:
+        return {"mean": float("nan"), "std": float("nan")}
+
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=1) if len(arr) > 1 else 0.0),
+    }
+
+
+def safe_nanargmax(values):
+    arr = np.asarray(values, dtype=float)
+
+    if len(arr) == 0 or not np.isfinite(arr).any():
+        return 0
+
+    return int(np.nanargmax(arr))
+
+
+def _fmt_metric(v):
+    if isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v):
+        return f"{float(v):.3f}"
+    return "NA"
+
+
+def _print_binary_metrics_block(title, m, extra=""):
+    print(f"  [{title}]{(' ' + extra) if extra else ''}")
+    print(
+        f"    Acc={_fmt_metric(m['accuracy'])}, "
+        f"Sens={_fmt_metric(m['sensitivity_recall'])}, "
+        f"Spec={_fmt_metric(m['specificity'])}, "
+        f"PPV={_fmt_metric(m['precision_ppv'])}, "
+        f"NPV={_fmt_metric(m['npv'])}"
+    )
+    print(
+        f"    AUROC={_fmt_metric(m['auroc'])}, "
+        f"F1={_fmt_metric(m['f1'])}, "
+        f"Brier={_fmt_metric(m['brier'])}"
+    )
+    print(
+        f"    TP={m['tp']}, FP={m['fp']}, TN={m['tn']}, FN={m['fn']}, "
+        f"Prevalence={_fmt_metric(m['prevalence'])}"
+    )
+
+
+def _print_binary_metrics_with_ci(title, m, boot, extra=""):
+    print(f"  [{title}]{(' ' + extra) if extra else ''}")
+
+    def _f(k):
+        if k in boot and np.isfinite(boot[k][0]):
+            _, lo, hi = boot[k]
+            return f"{_fmt_metric(m[k])} (95% CI {lo:.3f}-{hi:.3f})"
+        return _fmt_metric(m[k])
+
+    for key, label in [
+        ("accuracy", "Acc"),
+        ("sensitivity_recall", "Sens"),
+        ("specificity", "Spec"),
+        ("precision_ppv", "PPV"),
+        ("npv", "NPV"),
+        ("f1", "F1"),
+        ("auroc", "AUROC"),
+        ("brier", "Brier"),
+    ]:
+        print(f"    {label:<10s}= {_f(key)}")
+
+    print(
+        f"    TP={m['tp']}, FP={m['fp']}, TN={m['tn']}, FN={m['fn']}, "
+        f"Prevalence={_fmt_metric(m['prevalence'])}"
+    )
+
+
+def _print_multi_metrics_block(title, m, num_classes, class_names, extra=""):
+    print(f"  [{title}]{(' ' + extra) if extra else ''}")
+    print(f"    Acc                         = {_fmt_metric(m['accuracy'])}")
+    print(f"    Balanced Acc                = {_fmt_metric(m.get('balanced_accuracy', np.nan))}")
+    print(f"    Sens-macro                  = {_fmt_metric(m['sensitivity_recall_macro'])}")
+    print(f"    Spec-macro                  = {_fmt_metric(m['specificity_macro'])}")
+    print(f"    PPV-macro                   = {_fmt_metric(m['precision_ppv_macro'])}")
+    print(f"    NPV-macro                   = {_fmt_metric(m['npv_macro'])}")
+    print(f"    F1-macro                    = {_fmt_metric(m['f1_macro'])}")
+    print(f"    AUROC-macro                 = {_fmt_metric(m['auroc_macro'])}")
+    print(f"    Brier-macro OvR             = {_fmt_metric(m['brier_macro'])}")
+    print(f"    Brier-multiclass normalized = {_fmt_metric(m.get('brier_multiclass_normalized', np.nan))}")
+
+    for k in range(num_classes):
+        cname = class_names[k] if k < len(class_names) else f"class{k}"
+        print(f"    -- Class {k} ({cname}) --")
+        print(
+            f"       Sens={_fmt_metric(m[f'sensitivity_recall_class{k}'])}, "
+            f"Spec={_fmt_metric(m[f'specificity_class{k}'])}, "
+            f"PPV={_fmt_metric(m[f'precision_ppv_class{k}'])}, "
+            f"NPV={_fmt_metric(m[f'npv_class{k}'])}, "
+            f"F1={_fmt_metric(m[f'f1_class{k}'])}"
+        )
+        print(
+            f"       AUROC={_fmt_metric(m[f'auroc_class{k}'])}, "
+            f"Brier={_fmt_metric(m[f'brier_class{k}'])}"
+        )
+
+
+def _print_multi_metrics_with_ci(title, m, boot, num_classes, class_names, extra=""):
+    print(f"  [{title}]{(' ' + extra) if extra else ''}")
+
+    def _f(k):
+        if k in boot and np.isfinite(boot[k][0]):
+            _, lo, hi = boot[k]
+            return f"{_fmt_metric(m[k])} (95% CI {lo:.3f}-{hi:.3f})"
+        if k in m:
+            return _fmt_metric(m[k])
+        return "NA"
+
+    for key, label in [
+        ("accuracy", "Acc"),
+        ("balanced_accuracy", "Balanced Acc"),
+        ("sensitivity_recall_macro", "Sens-macro"),
+        ("specificity_macro", "Spec-macro"),
+        ("precision_ppv_macro", "PPV-macro"),
+        ("npv_macro", "NPV-macro"),
+        ("f1_macro", "F1-macro"),
+        ("auroc_macro", "AUROC-macro"),
+        ("brier_macro", "Brier-macro OvR"),
+        ("brier_multiclass_normalized", "Brier-multiclass normalized"),
+    ]:
+        print(f"    {label:<32s}= {_f(key)}")
+
+    for k in range(num_classes):
+        cname = class_names[k] if k < len(class_names) else f"class{k}"
+        print(f"    -- Class {k} ({cname}) --")
+
+        for key, label in [
+            (f"sensitivity_recall_class{k}", "Sens"),
+            (f"specificity_class{k}", "Spec"),
+            (f"precision_ppv_class{k}", "PPV"),
+            (f"npv_class{k}", "NPV"),
+            (f"f1_class{k}", "F1"),
+            (f"auroc_class{k}", "AUROC"),
+            (f"brier_class{k}", "Brier"),
+        ]:
+            print(f"       {label:<6s}= {_f(key)}")
+
+        print(
+            f"       TP={m[f'tp_class{k}']}, FP={m[f'fp_class{k}']}, "
+            f"TN={m[f'tn_class{k}']}, FN={m[f'fn_class{k}']}, "
+            f"Prevalence={_fmt_metric(m[f'prevalence_class{k}'])}"
+        )
+
+
+def _print_fold_summary(fold_summary, keys_order):
+    print("  [Per-Fold Summary, Mean ± SD Across Folds]")
+
+    for k in keys_order:
+        if k in fold_summary:
+            mean = fold_summary[k]["mean"]
+            std = fold_summary[k]["std"]
+            if np.isfinite(mean):
+                print(f"    {k:<36s} = {mean:.3f} ± {std:.3f}")
+
+
+# ============================================================
+# BLOCK 16: EXPERIMENT RUNNER
+# ============================================================
+
+def run_experiment(
+    patient_cache,
+    patient_lookup,
+    raw_patient_count,
+    n,
+    cutoff,
+    task,
+    exp_dir,
+    num_classes,
+    class_names,
+):
+    print(f"\n\nStarting round: {task_display_name(task)}, N = {n}, PSA cutoff = {cutoff}")
+
+    run_dir = os.path.join(exp_dir, f"n{n}_cutoff{cutoff}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    round_seed = stable_seed(task, n, cutoff, "round", base_seed=RANDOM_SEED)
+
+    round_df = compute_round_patient_table(
+        patient_cache=patient_cache,
+        n=n,
+        cutoff=cutoff,
+        task=task,
+    )
+
+    test_pids, folds = split_round_patients_kfold(
+        round_df=round_df,
+        seed=round_seed,
+        n_splits=N_SPLITS,
+        test_ratio=TEST_RATIO,
+    )
+
+    split_assignment_df = make_split_assignment_df(test_pids, folds)
+    split_assignment_df.to_csv(
+        os.path.join(run_dir, f"split_assignments_{task}_n{n}_c{cutoff}.csv"),
+        index=False,
+    )
+
+    round_df.to_csv(
+        os.path.join(run_dir, f"round_patient_table_{task}_n{n}_c{cutoff}.csv"),
+        index=False,
+    )
+
+    leakage_report = verify_no_patient_leakage(test_pids, folds)
+    save_json(
+        leakage_report,
+        os.path.join(run_dir, f"leakage_check_{task}_n{n}_c{cutoff}.json"),
+    )
+
+    audit_summary = summarize_round_audit_kfold(
+        round_df=round_df,
+        test_pids=test_pids,
+        folds=folds,
+        raw_patient_count=raw_patient_count,
+        n=n,
+        cutoff=cutoff,
+        task=task,
+    )
+
+    print_round_audit(audit_summary, n, cutoff, task)
+
+    save_json(
+        audit_summary,
+        os.path.join(run_dir, f"audit_{task}_n{n}_c{cutoff}.json"),
+    )
+
+    pd.DataFrame(audit_summary["splits"]).to_csv(
+        os.path.join(run_dir, f"audit_splits_{task}_n{n}_c{cutoff}.csv"),
+        index=False,
+    )
+
+    if audit_summary["global"]["eligible_patients"] == 0:
+        print("  [skip] No eligible patients.")
+        return None
+
+    sequence_bank = build_sequence_bank(
+        patient_cache=patient_cache,
+        round_df=round_df,
+        n=n,
+        cutoff=cutoff,
+        task=task,
+        patient_lookup=patient_lookup,
+    )
+
+    test_seq = subset_sequence_bank(sequence_bank, test_pids)
+
+    if test_seq is None:
+        print("  [skip] No eligible sequences in test set.")
+        return None
+
+    X_test, y_test, pids_test, labels_test, meta_test, feature_names = test_seq
+
+    if num_classes == 2 and len(np.unique(y_test)) < 2:
+        print("  [skip] Test set has only one class.")
+        return None
+
+    fold_histories: List[Dict[str, List[float]]] = []
+    fold_test_probs: List[np.ndarray] = []
+    fold_test_probs_cal: List[np.ndarray] = []
+    fold_val_thresholds: List[float] = []
+    fold_val_thresholds_ovr: List[np.ndarray] = []
+    fold_metrics_records: List[Dict[str, float]] = []
+    fold_ids_used: List[int] = []
+    fold_val_scores: List[float] = []
+    fold_artifacts: List[Dict[str, Any]] = []
+    fold_val_prediction_frames: List[pd.DataFrame] = []
+    fold_test_prediction_frames: List[pd.DataFrame] = []
+    fold_calibration_infos: List[Dict[str, Any]] = []
+
+    print(f"  Test sequence count: {len(y_test):,}")
+    print(f"  Test class counts: {dict(zip(*np.unique(y_test, return_counts=True)))}")
+
+    need_posthoc_model = PLOT_ATTENTION or RUN_FEATURE_IMPORTANCE
+
+    for fold_idx, (train_pids, val_pids) in enumerate(folds):
+        print(f"\n  ---- Fold {fold_idx + 1}/{len(folds)} ----")
+        fold_seed = stable_seed(task, n, cutoff, "fold", fold_idx, base_seed=RANDOM_SEED)
+        set_global_seed(fold_seed)
+
+        train_seq = subset_sequence_bank(sequence_bank, train_pids)
+        val_seq = subset_sequence_bank(sequence_bank, val_pids)
+
+        if train_seq is None or val_seq is None:
+            print(f"  [skip fold {fold_idx}] Empty train or validation sequences.")
+            continue
+
+        X_tr, y_tr, pids_tr, labels_tr, meta_tr, _ = train_seq
+        X_va, y_va, pids_va, labels_va, meta_va, _ = val_seq
+
+        if not class_counts_ok(y_tr, num_classes):
+            print(
+                f"  [skip fold {fold_idx}] training class counts too small: "
+                f"{dict(zip(*np.unique(y_tr, return_counts=True)))}"
+            )
+            continue
+
+        if num_classes == 2 and len(np.unique(y_va)) < 2:
+            print(f"  [skip fold {fold_idx}] validation has only one class.")
+            continue
+
+        scaler = fit_scaler(X_tr)
+        X_tr_s = apply_scaler(X_tr, scaler)
+        X_va_s = apply_scaler(X_va, scaler)
+        X_te_s = apply_scaler(X_test, scaler)
+
+        X_tr_fit, y_tr_fit, class_weight = handle_imbalance_train(
+            X_train=X_tr_s,
+            y_train=y_tr,
+            method=IMBALANCE_METHOD,
+            seed=fold_seed,
+        )
+
+        print(
+            f"    Training rows after imbalance: {len(y_tr_fit):,}, "
+            f"Validation rows: {len(y_va):,}, Class weight: {class_weight}"
+        )
+
+        tf.keras.backend.clear_session()
+        gc.collect()
+        set_global_seed(fold_seed)
+
+        model, attn_model = build_model(
+            n_timesteps=n,
+            n_features=X_tr.shape[-1],
+            num_classes=num_classes,
+        )
+
+        callbacks = [
+            EarlyStopping(
+                monitor="val_loss",
+                patience=EARLY_STOP_PATIENCE,
+                restore_best_weights=True,
+            ),
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=LR_REDUCE_PATIENCE,
+                min_lr=1e-5,
+                verbose=1 if TF_VERBOSE else 0,
+            ),
+        ]
+
+        history = model.fit(
+            X_tr_fit,
+            y_tr_fit,
+            validation_data=(X_va_s, y_va),
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            verbose=TF_VERBOSE,
+            callbacks=callbacks,
+            class_weight=class_weight,
+            shuffle=True,
+        )
+
+        fold_histories.append(history.history)
+
+        plot_history(
+            history.history,
+            os.path.join(run_dir, f"history_{task}_n{n}_c{cutoff}_fold{fold_idx}.png"),
+            title=make_plot_title(task, n, cutoff, f"Training History, Fold {fold_idx}"),
+        )
+
+        model_path = os.path.join(run_dir, f"model_{task}_n{n}_c{cutoff}_fold{fold_idx}.keras")
+        scaler_path = os.path.join(run_dir, f"scaler_{task}_n{n}_c{cutoff}_fold{fold_idx}.pkl")
+
+        try:
+            with open(scaler_path, "wb") as f:
+                pickle.dump(scaler, f)
+        except Exception as e:
+            print(f"  [warn] Could not save scaler: {e}")
+
+        if SAVE_MODELS or need_posthoc_model:
+            try:
+                model.save(model_path)
+            except Exception as e:
+                print(f"  [warn] Could not save model: {e}")
+                model_path = None
+        else:
+            model_path = None
+
+        if num_classes == 2:
+            p_val_raw = predict_model(model, X_va_s).ravel()
+            p_test_raw = predict_model(model, X_te_s).ravel()
+
+            p_val_cal, p_test_cal, cal_obj = fit_and_apply_calibration(
+                p_val_raw=p_val_raw,
+                y_val=y_va,
+                p_test_raw=p_test_raw,
+                method=CALIBRATION_METHOD,
+            )
+
+            thr = choose_threshold(
+                y_val=y_va,
+                p_val=p_val_cal,
+                method="f2",
+                task=task,
+            )
+
+            y_hat_val = (p_val_cal >= thr).astype(int)
+            y_hat_fold = (p_test_cal >= thr).astype(int)
+
+            metrics_fold = binary_clinical_metrics(y_test, y_hat_fold, p_test_cal)
+
+            fold_metrics_records.append(metrics_fold)
+            fold_ids_used.append(fold_idx)
+            fold_val_thresholds.append(thr)
+            fold_test_probs.append(p_test_raw)
+            fold_test_probs_cal.append(p_test_cal)
+
+            fold_val_prediction_frames.append(
+                make_binary_prediction_frame(
+                    meta=meta_va,
+                    y_true=y_va,
+                    p_raw=p_val_raw,
+                    p_cal=p_val_cal,
+                    threshold=thr,
+                    fold=fold_idx,
+                    split="val",
+                    y_pred=y_hat_val,
+                )
+            )
+
+            fold_test_prediction_frames.append(
+                make_binary_prediction_frame(
+                    meta=meta_test,
+                    y_true=y_test,
+                    p_raw=p_test_raw,
+                    p_cal=p_test_cal,
+                    threshold=thr,
+                    fold=fold_idx,
+                    split="test_per_fold",
+                    y_pred=y_hat_fold,
+                )
+            )
+
+            if cal_obj is not None:
+                try:
+                    with open(
+                        os.path.join(run_dir, f"calibrator_{task}_n{n}_c{cutoff}_fold{fold_idx}.pkl"),
+                        "wb",
+                    ) as f:
+                        pickle.dump(cal_obj, f)
+                except Exception as e:
+                    print(f"  [warn] Could not save calibrator: {e}")
+
+            try:
+                val_score = roc_auc_score(y_va, p_val_cal)
+            except Exception:
+                val_score = np.nan
+
+            fold_val_scores.append(float(val_score))
+            fold_artifacts.append({
+                "fold": int(fold_idx),
+                "model_path": model_path,
+                "scaler_path": scaler_path,
+                "val_selection_score": float(val_score) if np.isfinite(val_score) else np.nan,
+                "val_selection_metric": "AUROC",
+            })
+
+            _print_binary_metrics_block(
+                title=f"Fold {fold_idx} Test",
+                m=metrics_fold,
+                extra=f"threshold={thr:.4f}",
+            )
+
+        else:
+            p_val_raw = predict_model(model, X_va_s)
+            p_test_raw = predict_model(model, X_te_s)
+
+            p_val_cal, p_test_cal, cal_obj, cal_info = fit_and_apply_multiclass_calibration(
+                p_val_raw=p_val_raw,
+                y_val=y_va,
+                p_test_raw=p_test_raw,
+                method=CALIBRATION_METHOD,
+                num_classes=num_classes,
+            )
+
+            cal_info["fold"] = int(fold_idx)
+            fold_calibration_infos.append(cal_info)
+
+            thr_ovr = choose_thresholds_ovr(
+                y_val=y_va,
+                p_val_proba=p_val_cal,
+                method="f2",
+                num_classes=num_classes,
+            )
+
+            y_hat_val = predict_ovr(p_val_cal, thr_ovr)
+            y_hat_fold = predict_ovr(p_test_cal, thr_ovr)
+
+            metrics_fold = multiclass_clinical_metrics(
+                y_true=y_test,
+                y_pred=y_hat_fold,
+                y_proba=p_test_cal,
+                num_classes=num_classes,
+            )
+
+            fold_metrics_records.append(metrics_fold)
+            fold_ids_used.append(fold_idx)
+            fold_val_thresholds_ovr.append(thr_ovr)
+            fold_test_probs.append(p_test_raw)
+            fold_test_probs_cal.append(p_test_cal)
+
+            fold_val_prediction_frames.append(
+                make_multiclass_prediction_frame(
+                    meta=meta_va,
+                    y_true=y_va,
+                    p_raw=p_val_raw,
+                    p_cal=p_val_cal,
+                    thresholds=thr_ovr,
+                    fold=fold_idx,
+                    split="val",
+                    class_names=class_names,
+                    y_pred=y_hat_val,
+                )
+            )
+
+            fold_test_prediction_frames.append(
+                make_multiclass_prediction_frame(
+                    meta=meta_test,
+                    y_true=y_test,
+                    p_raw=p_test_raw,
+                    p_cal=p_test_cal,
+                    thresholds=thr_ovr,
+                    fold=fold_idx,
+                    split="test_per_fold",
+                    class_names=class_names,
+                    y_pred=y_hat_fold,
+                )
+            )
+
+            if cal_obj is not None:
+                try:
+                    with open(
+                        os.path.join(run_dir, f"calibrator_{task}_n{n}_c{cutoff}_fold{fold_idx}.pkl"),
+                        "wb",
+                    ) as f:
+                        pickle.dump(cal_obj, f)
+                except Exception as e:
+                    print(f"  [warn] Could not save multiclass calibrator: {e}")
+
+            try:
+                y_bin_v = label_binarize(y_va, classes=list(range(num_classes)))
+                val_score = roc_auc_score(
+                    y_bin_v,
+                    p_val_cal,
+                    average="macro",
+                    multi_class="ovr",
+                )
+            except Exception:
+                val_score = np.nan
+
+            fold_val_scores.append(float(val_score))
+            fold_artifacts.append({
+                "fold": int(fold_idx),
+                "model_path": model_path,
+                "scaler_path": scaler_path,
+                "val_selection_score": float(val_score) if np.isfinite(val_score) else np.nan,
+                "val_selection_metric": "Macro AUROC",
+            })
+
+            _print_multi_metrics_block(
+                title=f"Fold {fold_idx} Test",
+                m=metrics_fold,
+                num_classes=num_classes,
+                class_names=class_names,
+                extra=f"OvR thresholds={np.round(thr_ovr, 3).tolist()}",
+            )
+
+        del model, attn_model, X_tr_s, X_va_s, X_te_s, X_tr_fit, y_tr_fit
+        gc.collect()
+        tf.keras.backend.clear_session()
+
+    if len(fold_metrics_records) == 0:
+        print("  [skip] No usable folds.")
+        return None
+
+    result: Dict[str, Any] = {
+        "task": task,
+        "experiment_name": task_display_name(task),
+        "n": int(n),
+        "cutoff": float(cutoff),
+        "n_splits": int(N_SPLITS),
+        "test_ratio": float(TEST_RATIO),
+        "imbalance_method": IMBALANCE_METHOD,
+        "threshold_method": THRESHOLD_METHOD,
+        "audit": audit_summary,
+        "feature_names": feature_names,
+        "leakage_verification": leakage_report,
+        "n_folds_used": int(len(fold_metrics_records)),
+        "fold_ids_used": fold_ids_used,
+        "fold_metrics": fold_metrics_records,
+        "fold_artifacts": fold_artifacts,
+    }
+
+    metric_keys = set()
+    for m in fold_metrics_records:
+        for k, v in m.items():
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                metric_keys.add(k)
+
+    fold_summary = {}
+    for k in metric_keys:
+        fold_summary[k] = _summarize_fold_metric_list(
+            [m.get(k, np.nan) for m in fold_metrics_records]
+        )
+
+    result["fold_metrics_summary"] = fold_summary
+
+    dyn_df = plot_learning_dynamics_kfold(
+        histories=fold_histories,
+        save_path=os.path.join(run_dir, f"learning_dynamics_kfold_{task}_n{n}_c{cutoff}.png"),
+        title=make_plot_title(task, n, cutoff, "K-Fold Learning Dynamics"),
+    )
+
+    plot_data: Dict[str, pd.DataFrame] = {
+        "learning_dynamics_kfold": dyn_df,
+        "split_assignments": split_assignment_df,
+        "audit_splits": pd.DataFrame(audit_summary["splits"]),
+    }
+
+    raw_arrays: Dict[str, np.ndarray] = {
+        "X_test_unscaled": X_test.astype(np.float32),
+        "y_test": y_test.astype(np.int32),
+        "labels_test": labels_test.astype(np.int32),
+    }
+
+    if fold_val_prediction_frames:
+        plot_data["fold_val_predictions"] = pd.concat(fold_val_prediction_frames, ignore_index=True)
+
+    if fold_test_prediction_frames:
+        plot_data["fold_test_predictions_by_fold"] = pd.concat(fold_test_prediction_frames, ignore_index=True)
+
+    if len(fold_test_probs) > 0:
+        raw_arrays["fold_test_probs_raw"] = np.stack(fold_test_probs, axis=0)
+        raw_arrays["fold_test_probs_calibrated"] = np.stack(fold_test_probs_cal, axis=0)
+
+    best_artifact = None
+    if fold_artifacts:
+        best_idx = safe_nanargmax(fold_val_scores)
+        best_artifact = fold_artifacts[best_idx]
+        result["best_fold_for_posthoc"] = best_artifact
+
+    best_model = None
+    best_attn = None
+    best_scaler = None
+    X_te_s_best = None
+
+    def _load_best_for_posthoc():
+        nonlocal best_model, best_attn, best_scaler, X_te_s_best
+
+        if best_artifact is None:
+            return False
+        if not best_artifact.get("model_path") or not os.path.exists(best_artifact["model_path"]):
+            return False
+        if not best_artifact.get("scaler_path") or not os.path.exists(best_artifact["scaler_path"]):
+            return False
+
+        best_model = load_saved_model_for_posthoc(best_artifact["model_path"])
+        best_attn = make_attention_extractor(best_model)
+
+        with open(best_artifact["scaler_path"], "rb") as f:
+            best_scaler = pickle.load(f)
+
+        X_te_s_best = apply_scaler(X_test, best_scaler)
+        return True
+
+    if num_classes == 2:
+        ensemble_p_test = np.mean(np.stack(fold_test_probs_cal, axis=0), axis=0)
+        ensemble_threshold = float(np.mean(fold_val_thresholds))
+        ensemble_y_hat = (ensemble_p_test >= ensemble_threshold).astype(int)
+
+        metrics_point = binary_clinical_metrics(y_test, ensemble_y_hat, ensemble_p_test)
+        metrics_boot = boot_clinical_metrics(
+            y_true=y_test,
+            y_pred=ensemble_y_hat,
+            y_score=ensemble_p_test,
+            n_boot=N_BOOTSTRAP,
+            seed=RANDOM_SEED,
+        )
+
+        cal_extra, calibration_df = calibration_extras(y_test, ensemble_p_test)
+        cm = confusion_matrix(y_test, ensemble_y_hat, labels=[0, 1])
+
+        result.update({
+            "threshold": float(ensemble_threshold),
+            "fold_thresholds": [float(t) for t in fold_val_thresholds],
+            "calibration_method": CALIBRATION_METHOD,
+            "metrics_point": metrics_point,
+            "metrics_boot": metrics_boot,
+            "calibration": cal_extra,
+            "test_confusion": cm.tolist(),
+        })
+
+        print()
+        _print_binary_metrics_with_ci(
+            title="Ensemble Test",
+            m=metrics_point,
+            boot=metrics_boot,
+            extra=f"threshold={ensemble_threshold:.4f}",
+        )
+
+        print(
+            f"    Calibration: ECE={cal_extra['ece']:.4f}, "
+            f"MCE={cal_extra['mce']:.4f}, "
+            f"Slope={_fmt_metric(cal_extra['calibration_slope'])}, "
+            f"Intercept={_fmt_metric(cal_extra['calibration_intercept'])}"
+        )
+
+        _print_fold_summary(
+            fold_summary=fold_summary,
+            keys_order=[
+                "accuracy",
+                "sensitivity_recall",
+                "specificity",
+                "precision_ppv",
+                "npv",
+                "f1",
+                "auroc",
+                "brier",
+            ],
+        )
+
+        plot_roc(
+            y_test,
+            ensemble_p_test,
+            os.path.join(run_dir, f"roc_{task}_n{n}_c{cutoff}.png"),
+            make_plot_title(task, n, cutoff, "ROC Curve"),
+        )
+
+        plot_confusion(
+            cm,
+            os.path.join(run_dir, f"confusion_{task}_n{n}_c{cutoff}.png"),
+            class_names=class_names,
+            title=make_plot_title(task, n, cutoff, "Confusion Matrix"),
+        )
+
+        plot_calibration(
+            y_test,
+            ensemble_p_test,
+            os.path.join(run_dir, f"calibration_{task}_n{n}_c{cutoff}.png"),
+            make_plot_title(task, n, cutoff, "Calibration Plot"),
+        )
+
+        fpr, tpr, thr_roc = roc_curve(y_test, ensemble_p_test)
+
+        plot_data["roc"] = pd.DataFrame({
+            "fpr": fpr,
+            "tpr": tpr,
+            "threshold": thr_roc,
+        })
+
+        plot_data["calibration"] = calibration_df
+        plot_data["confusion_matrix"] = confusion_to_long_df(cm, class_names)
+
+        preds_df = meta_test.copy()
+        preds_df["y_true"] = y_test
+
+        for k_, p in enumerate(fold_test_probs_cal):
+            preds_df[f"p_fold{k_}"] = p
+
+        preds_df["p_ensemble"] = ensemble_p_test
+        preds_df["threshold_ensemble"] = ensemble_threshold
+        preds_df["y_pred"] = ensemble_y_hat
+
+        plot_data["predictions_test"] = preds_df
+        preds_df.to_csv(
+            os.path.join(run_dir, f"predictions_test_{task}_n{n}_c{cutoff}.csv"),
+            index=False,
+        )
+
+        if PLOT_PSA_TRAJECTORY:
+            psa_examples_df = plot_psa_trajectories(
+                X_test,
+                ensemble_p_test,
+                os.path.join(run_dir, f"psa_traj_{task}_n{n}_c{cutoff}.png"),
+                make_plot_title(task, n, cutoff, "Representative PSA Trajectories"),
+            )
+            if len(psa_examples_df) > 0:
+                plot_data["psa_trajectory_examples"] = psa_examples_df
+
+        plot_data["sequence_features_test_long"] = sequence_features_long_df(
+            X_unscaled=X_test,
+            meta=meta_test,
+            y_true=y_test,
+            y_pred=ensemble_y_hat,
+            feature_names=feature_names,
+            proba=ensemble_p_test,
+            class_names=class_names,
+        )
+
+        if (PLOT_ATTENTION or RUN_FEATURE_IMPORTANCE) and _load_best_for_posthoc():
+            if PLOT_ATTENTION and best_attn is not None:
+                attn_examples_df = plot_attention_examples(
+                    best_attn,
+                    X_te_s_best,
+                    os.path.join(
+                        run_dir,
+                        f"attention_examples_{task}_n{n}_c{cutoff}_bestfold{best_artifact['fold']}.png",
+                    ),
+                    title=make_plot_title(task, n, cutoff, "Attention Heatmap Examples"),
+                    risk_scores=ensemble_p_test,
+                    meta=meta_test,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    proba=ensemble_p_test,
+                    class_names=class_names,
+                )
+                if len(attn_examples_df) > 0:
+                    plot_data["attention_examples"] = attn_examples_df
+
+                attn_all = predict_model(best_attn, X_te_s_best).squeeze(-1)
+                plot_data["attention_all_test_bestfold"] = attention_long_df(
+                    attention_weights=attn_all,
+                    meta=meta_test,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    proba=ensemble_p_test,
+                    class_names=class_names,
+                )
+
+                attn_summaries = attention_summary_tables(
+                    attention_weights=attn_all,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    class_names=class_names,
+                )
+                for name, df_s in attn_summaries.items():
+                    plot_data[name] = df_s
+
+                if "attention_summary_by_true_class" in attn_summaries:
+                    plot_attention_summary_df(
+                        attn_summaries["attention_summary_by_true_class"],
+                        os.path.join(run_dir, f"attention_summary_true_class_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Mean Attention by True Class"),
+                        group_col="true_class",
+                    )
+
+                if "attention_summary_by_correctness" in attn_summaries:
+                    plot_attention_summary_df(
+                        attn_summaries["attention_summary_by_correctness"],
+                        os.path.join(run_dir, f"attention_summary_correctness_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Mean Attention by Prediction Correctness"),
+                        group_col="correctness",
+                    )
+
+            if RUN_FEATURE_IMPORTANCE:
+                fi = permutation_importance_binary(
+                    model=best_model,
+                    X_test_scaled=X_te_s_best,
+                    y_test=y_test,
+                    feature_names=feature_names,
+                    n_repeats=PERMUTATION_REPEATS,
+                    seed=RANDOM_SEED,
+                )
+
+                if len(fi) > 0:
+                    result["feature_importance"] = fi.to_dict(orient="records")
+                    plot_data["feature_importance"] = fi
+                    plot_feature_importance(
+                        fi,
+                        os.path.join(run_dir, f"feature_importance_auroc_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Permutation Feature Importance (AUROC Drop)"),
+                        metric="auroc",
+                    )
+
+        raw_arrays.update({
+            "ensemble_p_test": ensemble_p_test.astype(np.float64),
+            "ensemble_y_hat": ensemble_y_hat.astype(np.int32),
+            "test_confusion": cm.astype(np.int64),
+        })
+
+    else:
+        ensemble_p_test = np.mean(np.stack(fold_test_probs_cal, axis=0), axis=0)
+        ensemble_p_test = renormalize_proba(ensemble_p_test)
+
+        thr_arr = np.stack(fold_val_thresholds_ovr, axis=0)
+        ensemble_thr_ovr = thr_arr.mean(axis=0)
+        ensemble_y_hat = predict_ovr(ensemble_p_test, ensemble_thr_ovr)
+
+        metrics_point = multiclass_clinical_metrics(
+            y_true=y_test,
+            y_pred=ensemble_y_hat,
+            y_proba=ensemble_p_test,
+            num_classes=num_classes,
+        )
+
+        metrics_boot = boot_multiclass_clinical_metrics(
+            y_true=y_test,
+            y_pred=ensemble_y_hat,
+            y_proba=ensemble_p_test,
+            num_classes=num_classes,
+            n_boot=N_BOOTSTRAP,
+            seed=RANDOM_SEED,
+        )
+
+        cm = confusion_matrix(y_test, ensemble_y_hat, labels=list(range(num_classes)))
+
+        cal_per_class = {}
+        calibration_bin_frames = []
+
+        result.update({
+            "metrics_point": metrics_point,
+            "metrics_boot": metrics_boot,
+            "ovr_thresholds": ensemble_thr_ovr.tolist(),
+            "fold_ovr_thresholds": [t.tolist() for t in fold_val_thresholds_ovr],
+            "test_confusion": cm.tolist(),
+            "calibration_method": CALIBRATION_METHOD,
+            "fold_calibration_info": fold_calibration_infos,
+        })
+
+        print()
+        _print_multi_metrics_with_ci(
+            title="Ensemble Test",
+            m=metrics_point,
+            boot=metrics_boot,
+            num_classes=num_classes,
+            class_names=class_names,
+            extra=f"OvR thresholds={np.round(ensemble_thr_ovr, 3).tolist()}",
+        )
+
+        print("    Confusion Matrix:")
+        for row in cm:
+            print(f"      {row.tolist()}")
+
+        macro_keys = [
+            "accuracy",
+            "balanced_accuracy",
+            "sensitivity_recall_macro",
+            "specificity_macro",
+            "precision_ppv_macro",
+            "npv_macro",
+            "f1_macro",
+            "auroc_macro",
+            "brier_macro",
+            "brier_multiclass_normalized",
+        ]
+
+        per_class_keys = []
+        for k in range(num_classes):
+            per_class_keys += [
+                f"sensitivity_recall_class{k}",
+                f"specificity_class{k}",
+                f"precision_ppv_class{k}",
+                f"npv_class{k}",
+                f"f1_class{k}",
+                f"auroc_class{k}",
+                f"brier_class{k}",
+            ]
+
+        _print_fold_summary(
+            fold_summary=fold_summary,
+            keys_order=macro_keys + per_class_keys,
+        )
+
+        plot_confusion(
+            cm,
+            os.path.join(run_dir, f"confusion_{task}_n{n}_c{cutoff}.png"),
+            class_names=class_names,
+            title=make_plot_title(task, n, cutoff, "Confusion Matrix"),
+        )
+
+        plot_data["confusion_matrix"] = confusion_to_long_df(cm, class_names)
+
+        for k in range(num_classes):
+            cname = class_names[k] if k < len(class_names) else f"class{k}"
+            safe_cname = _class_col_name(cname)
+
+            y_bin_k = (y_test == k).astype(int)
+            p_k = ensemble_p_test[:, k]
+
+            cal_k, calib_df_k = calibration_extras(y_bin_k, p_k)
+            cal_per_class[f"class{k}"] = cal_k
+
+            calib_df_k.insert(0, "class_name", cname)
+            calib_df_k.insert(0, "class_index", k)
+            calibration_bin_frames.append(calib_df_k)
+
+            plot_roc(
+                y_bin_k,
+                p_k,
+                os.path.join(run_dir, f"roc_{task}_n{n}_c{cutoff}_class{k}_{safe_cname}.png"),
+                make_plot_title(task, n, cutoff, "ROC Curve", class_name=cname),
+            )
+
+            plot_calibration(
+                y_bin_k,
+                p_k,
+                os.path.join(run_dir, f"calibration_{task}_n{n}_c{cutoff}_class{k}_{safe_cname}.png"),
+                make_plot_title(task, n, cutoff, "Calibration Plot", class_name=cname),
+            )
+
+            if len(np.unique(y_bin_k)) > 1:
+                fpr, tpr, thr_roc = roc_curve(y_bin_k, p_k)
+
+                plot_data[f"roc_class{k}_{safe_cname}"] = pd.DataFrame({
+                    "class_index": k,
+                    "class_name": cname,
+                    "fpr": fpr,
+                    "tpr": tpr,
+                    "threshold": thr_roc,
+                })
+
+        if calibration_bin_frames:
+            plot_data["calibration_bins_all_classes"] = pd.concat(
+                calibration_bin_frames,
+                ignore_index=True,
+            )
+
+        result["calibration_per_class"] = cal_per_class
+
+        preds_df = meta_test.copy()
+        preds_df["y_true"] = y_test
+        preds_df["y_pred"] = ensemble_y_hat
+
+        for k, cname in enumerate(class_names):
+            safe_cname = _class_col_name(cname)
+            preds_df[f"p_{safe_cname}"] = ensemble_p_test[:, k]
+            preds_df[f"ovr_threshold_{safe_cname}"] = float(ensemble_thr_ovr[k])
+
+        plot_data["predictions_test"] = preds_df
+        preds_df.to_csv(
+            os.path.join(run_dir, f"predictions_test_{task}_n{n}_c{cutoff}.csv"),
+            index=False,
+        )
+
+        plot_data["sequence_features_test_long"] = sequence_features_long_df(
+            X_unscaled=X_test,
+            meta=meta_test,
+            y_true=y_test,
+            y_pred=ensemble_y_hat,
+            feature_names=feature_names,
+            proba=ensemble_p_test,
+            class_names=class_names,
+        )
+
+        if PLOT_PSA_TRAJECTORY:
+            crossing_risk = 1.0 - ensemble_p_test[:, 0]
+            psa_examples_df = plot_psa_trajectories(
+                X_test,
+                crossing_risk,
+                os.path.join(run_dir, f"psa_traj_{task}_n{n}_c{cutoff}.png"),
+                make_plot_title(task, n, cutoff, "Representative PSA Trajectories"),
+            )
+            if len(psa_examples_df) > 0:
+                plot_data["psa_trajectory_examples"] = psa_examples_df
+
+        if (PLOT_ATTENTION or RUN_FEATURE_IMPORTANCE) and _load_best_for_posthoc():
+            crossing_risk = 1.0 - ensemble_p_test[:, 0]
+
+            if PLOT_ATTENTION and best_attn is not None:
+                attn_examples_df = plot_attention_examples(
+                    best_attn,
+                    X_te_s_best,
+                    os.path.join(
+                        run_dir,
+                        f"attention_examples_{task}_n{n}_c{cutoff}_bestfold{best_artifact['fold']}.png",
+                    ),
+                    title=make_plot_title(task, n, cutoff, "Attention Heatmap Examples"),
+                    risk_scores=crossing_risk,
+                    meta=meta_test,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    proba=ensemble_p_test,
+                    class_names=class_names,
+                )
+                if len(attn_examples_df) > 0:
+                    plot_data["attention_examples"] = attn_examples_df
+
+                attn_all = predict_model(best_attn, X_te_s_best).squeeze(-1)
+                plot_data["attention_all_test_bestfold"] = attention_long_df(
+                    attention_weights=attn_all,
+                    meta=meta_test,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    proba=ensemble_p_test,
+                    class_names=class_names,
+                )
+
+                attn_summaries = attention_summary_tables(
+                    attention_weights=attn_all,
+                    y_true=y_test,
+                    y_pred=ensemble_y_hat,
+                    class_names=class_names,
+                )
+                for name, df_s in attn_summaries.items():
+                    plot_data[name] = df_s
+
+                if "attention_summary_by_true_class" in attn_summaries:
+                    plot_attention_summary_df(
+                        attn_summaries["attention_summary_by_true_class"],
+                        os.path.join(run_dir, f"attention_summary_true_class_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Mean Attention by True Class"),
+                        group_col="true_class",
+                    )
+
+                if "attention_summary_by_correctness" in attn_summaries:
+                    plot_attention_summary_df(
+                        attn_summaries["attention_summary_by_correctness"],
+                        os.path.join(run_dir, f"attention_summary_correctness_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Mean Attention by Prediction Correctness"),
+                        group_col="correctness",
+                    )
+
+            if RUN_FEATURE_IMPORTANCE:
+                fi = permutation_importance_multiclass(
+                    model=best_model,
+                    X_test_scaled=X_te_s_best,
+                    y_test=y_test,
+                    feature_names=feature_names,
+                    num_classes=num_classes,
+                    n_repeats=PERMUTATION_REPEATS,
+                    seed=RANDOM_SEED,
+                )
+
+                if len(fi) > 0:
+                    result["feature_importance"] = fi.to_dict(orient="records")
+                    plot_data["feature_importance"] = fi
+                    plot_feature_importance(
+                        fi,
+                        os.path.join(run_dir, f"feature_importance_auroc_{task}_n{n}_c{cutoff}.png"),
+                        make_plot_title(task, n, cutoff, "Permutation Feature Importance (AUROC Drop)"),
+                        metric="auroc",
+                    )
+
+        raw_arrays.update({
+            "ensemble_p_test": ensemble_p_test.astype(np.float64),
+            "ensemble_y_hat": ensemble_y_hat.astype(np.int32),
+            "ovr_thresholds": ensemble_thr_ovr.astype(np.float64),
+            "test_confusion": cm.astype(np.int64),
+        })
+
+    fold_df = pd.DataFrame(fold_metrics_records)
+    fold_df.insert(0, "fold", fold_ids_used)
+
+    plot_data["fold_metrics"] = fold_df
+    fold_df.to_csv(
+        os.path.join(run_dir, f"fold_metrics_{task}_n{n}_c{cutoff}.csv"),
+        index=False,
+    )
+
+    metadata = {
+        "task": task,
+        "experiment_name": task_display_name(task),
+        "n": int(n),
+        "cutoff": float(cutoff),
+        "num_classes": int(num_classes),
+        "class_names": class_names,
+        "feature_names": feature_names,
+        "calibration_method": CALIBRATION_METHOD,
+        "threshold_method": THRESHOLD_METHOD,
+        "plot_regeneration_note": (
+            "CSV files in plot_data_raw are the source of truth for regenerating retained plots "
+            "without retraining. Decision curve, threshold sweep, and PR curve plots are removed."
+        ),
+    }
+
+    save_plot_data_bundle(
+        plot_data=plot_data,
+        save_dir=run_dir,
+        prefix=f"{task}_n{n}_c{cutoff}",
+        arrays=raw_arrays,
+        metadata=metadata,
+    )
+
+    save_json(
+        result,
+        os.path.join(run_dir, f"result_{task}_n{n}_c{cutoff}.json"),
+    )
+
+    del best_model, best_attn, best_scaler, X_te_s_best
+    gc.collect()
+    tf.keras.backend.clear_session()
+
+    return result
+
+
+# ============================================================
+# BLOCK 17: PLOT REGENERATION WITHOUT RETRAINING
+# ============================================================
+
+def _load_plot_tables(raw_dir: str) -> Dict[str, pd.DataFrame]:
+    tables = {}
+
+    for p in Path(raw_dir).glob("*.csv"):
+        if p.name == "manifest.csv":
+            continue
+
+        try:
+            tables[p.stem] = pd.read_csv(p)
+        except Exception as e:
+            print(f"[warn] Could not read {p}: {e}")
+
+    return tables
+
+
+def regenerate_plots_for_run(run_dir: str, output_subdir: str = "regenerated_plots") -> None:
+    raw_root = Path(run_dir) / "plot_data_raw"
+
+    if not raw_root.exists():
+        print(f"No plot_data_raw folder found under: {run_dir}")
+        return
+
+    for raw_dir in raw_root.iterdir():
+        if not raw_dir.is_dir():
+            continue
+
+        meta_path = raw_dir / "metadata.json"
+        if not meta_path.exists():
+            continue
+
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        task = meta["task"]
+        n = int(meta["n"])
+        cutoff = float(meta["cutoff"])
+        class_names = meta["class_names"]
+        out_dir = Path(run_dir) / output_subdir / raw_dir.name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        tables = _load_plot_tables(str(raw_dir))
+
+        if "learning_dynamics_kfold" in tables:
+            plot_learning_dynamics_from_df(
+                tables["learning_dynamics_kfold"],
+                str(out_dir / "learning_dynamics_kfold.png"),
+                make_plot_title(task, n, cutoff, "K-Fold Learning Dynamics"),
+            )
+
+        if "confusion_matrix" in tables:
+            plot_confusion_from_long_df(
+                tables["confusion_matrix"],
+                str(out_dir / "confusion_matrix.png"),
+                class_names,
+                make_plot_title(task, n, cutoff, "Confusion Matrix"),
+            )
+
+        if "roc" in tables:
+            plot_roc_from_df(
+                tables["roc"],
+                str(out_dir / "roc_curve.png"),
+                make_plot_title(task, n, cutoff, "ROC Curve"),
+            )
+
+        if "calibration" in tables:
+            plot_calibration_from_df(
+                tables["calibration"],
+                str(out_dir / "calibration_plot.png"),
+                make_plot_title(task, n, cutoff, "Calibration Plot"),
+            )
+
+        for key, df in tables.items():
+            if key.startswith("roc_class"):
+                cname = str(df["class_name"].iloc[0]) if "class_name" in df.columns and len(df) else None
+                plot_roc_from_df(
+                    df,
+                    str(out_dir / f"{key}.png"),
+                    make_plot_title(task, n, cutoff, "ROC Curve", class_name=cname),
+                )
+
+        if "calibration_bins_all_classes" in tables:
+            for cls_idx, sub in tables["calibration_bins_all_classes"].groupby("class_index"):
+                cname = str(sub["class_name"].iloc[0])
+                plot_calibration_from_df(
+                    sub,
+                    str(out_dir / f"calibration_class{int(cls_idx)}.png"),
+                    make_plot_title(task, n, cutoff, "Calibration Plot", class_name=cname),
+                )
+
+        if "attention_examples" in tables:
+            plot_attention_examples_from_df(
+                tables["attention_examples"],
+                str(out_dir / "attention_examples.png"),
+                make_plot_title(task, n, cutoff, "Attention Heatmap Examples"),
+            )
+
+        if "attention_summary_by_true_class" in tables:
+            plot_attention_summary_df(
+                tables["attention_summary_by_true_class"],
+                str(out_dir / "attention_summary_by_true_class.png"),
+                make_plot_title(task, n, cutoff, "Mean Attention by True Class"),
+                group_col="true_class",
+            )
+
+        if "attention_summary_by_correctness" in tables:
+            plot_attention_summary_df(
+                tables["attention_summary_by_correctness"],
+                str(out_dir / "attention_summary_by_correctness.png"),
+                make_plot_title(task, n, cutoff, "Mean Attention by Prediction Correctness"),
+                group_col="correctness",
+            )
+
+        if "psa_trajectory_examples" in tables:
+            plot_psa_trajectory_examples_from_df(
+                tables["psa_trajectory_examples"],
+                str(out_dir / "psa_trajectory_examples.png"),
+                make_plot_title(task, n, cutoff, "Representative PSA Trajectories"),
+            )
+
+        if "feature_importance" in tables:
+            plot_feature_importance(
+                tables["feature_importance"],
+                str(out_dir / "feature_importance_auroc.png"),
+                make_plot_title(task, n, cutoff, "Permutation Feature Importance (AUROC Drop)"),
+                metric="auroc",
+            )
+
+        print(f"Regenerated plots saved to: {out_dir}")
+
+
+def regenerate_all_plots_under_result_root(result_root: str) -> None:
+    root = Path(result_root)
+
+    for run_dir in root.rglob("n*_cutoff*"):
+        if run_dir.is_dir() and (run_dir / "plot_data_raw").exists():
+            regenerate_plots_for_run(str(run_dir))
+
+
+# ============================================================
+# BLOCK 18: GRID RUNNER
+# ============================================================
+
+def config_snapshot():
+    return {
+        "DATA_PATH": DATA_PATH,
+        "RESULT_ROOT": RESULT_ROOT,
+        "PID_COL": PID_COL,
+        "TIME_COL": TIME_COL,
+        "PSA_COL": PSA_COL,
+        "LABEL_COL": LABEL_COL,
+        "RANDOM_SEED": RANDOM_SEED,
+        "NS": NS,
+        "CUTOFFS": CUTOFFS,
+        "RUN_TASKS": RUN_TASKS,
+        "TASK_CONFIGS": TASK_CONFIGS,
+        "TEST_RATIO": TEST_RATIO,
+        "N_SPLITS": N_SPLITS,
+        "TRAIN_RATIO_approx": TRAIN_RATIO,
+        "VAL_RATIO_approx": VAL_RATIO,
+        "STRATIFY_PATIENT_SPLIT": STRATIFY_PATIENT_SPLIT,
+        "IMBALANCE_METHOD": IMBALANCE_METHOD,
+        "MAX_CLASS_WEIGHT": MAX_CLASS_WEIGHT,
+        "THRESHOLD_METHOD": THRESHOLD_METHOD,
+        "PSA_CAP": PSA_CAP,
+        "USE_LOG1P_PSA_FEATURE": USE_LOG1P_PSA_FEATURE,
+        "T2V_KERNEL_SIZE": T2V_KERNEL_SIZE,
+        "LSTM_UNITS": LSTM_UNITS,
+        "DROPOUT_RATE": DROPOUT_RATE,
+        "L2_REG": L2_REG,
+        "USE_ATTENTION": USE_ATTENTION,
+        "LEARNING_RATE": LEARNING_RATE,
+        "GRADIENT_CLIPNORM": GRADIENT_CLIPNORM,
+        "EPOCHS": EPOCHS,
+        "BATCH_SIZE": BATCH_SIZE,
+        "PREDICT_BATCH_SIZE": PREDICT_BATCH_SIZE,
+        "EARLY_STOP_PATIENCE": EARLY_STOP_PATIENCE,
+        "LR_REDUCE_PATIENCE": LR_REDUCE_PATIENCE,
+        "N_BOOTSTRAP": N_BOOTSTRAP,
+        "CALIBRATION_METHOD": CALIBRATION_METHOD,
+        "SAVE_MODELS": SAVE_MODELS,
+        "SAVE_PLOT_DATA_EXCEL": SAVE_PLOT_DATA_EXCEL,
+        "EXCEL_CHUNK_LONG_TABLES": EXCEL_CHUNK_LONG_TABLES,
+        "PLOT_ATTENTION": PLOT_ATTENTION,
+        "PLOT_PSA_TRAJECTORY": PLOT_PSA_TRAJECTORY,
+        "RUN_FEATURE_IMPORTANCE": RUN_FEATURE_IMPORTANCE,
+        "PERMUTATION_REPEATS": PERMUTATION_REPEATS,
+        "MIN_CLASS_COUNT_TO_TRAIN": MIN_CLASS_COUNT_TO_TRAIN,
+        "removed_outputs": [
+            "isotonic_calibration",
+            "decision_curve_analysis",
+            "threshold_sweep_plot",
+            "precision_recall_curve_plot",
+        ],
+    }
+
+
+def run_task_grid(
+    patient_cache,
+    patient_lookup,
+    raw_patient_count,
+    task,
+):
+    cfg = TASK_CONFIGS[task]
+    exp_name = cfg["exp_name"]
+    num_classes = cfg["num_classes"]
+    class_names = cfg["class_names"]
+
+    exp_dir = os.path.join(RESULT_ROOT, exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    save_json(config_snapshot(), os.path.join(exp_dir, "run_config.json"))
+
+    results = []
+    grid = [(n, cutoff) for n in NS for cutoff in CUTOFFS]
+
+    t0 = time.time()
+
+    for n, cutoff in tqdm(grid, desc=f"{task_display_name(task)} Grid", total=len(grid)):
+        result = run_experiment(
+            patient_cache=patient_cache,
+            patient_lookup=patient_lookup,
+            raw_patient_count=raw_patient_count,
+            n=n,
+            cutoff=float(cutoff),
+            task=task,
+            exp_dir=exp_dir,
+            num_classes=num_classes,
+            class_names=class_names,
+        )
+
+        if result is not None:
+            results.append(result)
+
+    save_json(results, os.path.join(exp_dir, f"all_results_{task}.json"))
+
+    master_path = os.path.join(exp_dir, f"metrics_{exp_name}.xlsx")
+    summary = write_master_workbook(
+        results=results,
+        out_xlsx=master_path,
+        num_classes=num_classes,
+    )
+
+    summary.to_csv(
+        os.path.join(exp_dir, f"summary_{exp_name}.csv"),
+        index=False,
+    )
+
+    print(f"\n{task_display_name(task)} finished in {time.time() - t0:.1f} seconds.")
+    print(f"Saved to: {exp_dir}")
+    print(f"Master workbook: {master_path}")
+
+    return results
+
+
+# ============================================================
+# BLOCK 19: MAIN
+# ============================================================
+
+def main():
+    parse_args_and_update_config()
+    configure_tf_runtime()
+    set_global_seed(RANDOM_SEED)
+
+    requested_result_root = RESULT_ROOT
+    initialize_new_result_root()
+
+    print(f"Requested RESULT_ROOT: {requested_result_root}")
+    print(f"Actual new RESULT_ROOT: {RESULT_ROOT}")
+
+    save_json(
+        {
+            "requested_result_root": requested_result_root,
+            "actual_result_root": RESULT_ROOT,
+            "created_at": datetime.now().isoformat(),
+        },
+        os.path.join(RESULT_ROOT, "run_location.json"),
+    )
+
+    save_json(environment_snapshot(), os.path.join(RESULT_ROOT, "environment.json"))
+    save_json(config_snapshot(), os.path.join(RESULT_ROOT, "run_config_root.json"))
+    save_code_snapshot()
+
+    print(f"TensorFlow version: {tf.__version__}")
+    print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
+    print(f"DATA_PATH: {DATA_PATH}")
+    print(f"RESULT_ROOT: {RESULT_ROOT}")
+    print(f"Experiment order: {[TASK_CONFIGS[t]['display_name'] for t in RUN_TASKS]}")
+    print(f"IMBALANCE_METHOD: {IMBALANCE_METHOD}")
+    print(f"CALIBRATION_METHOD: {CALIBRATION_METHOD}")
+    print(f"THRESHOLD_METHOD: {THRESHOLD_METHOD}")
+    print(
+        f"K-fold split: test_ratio={TEST_RATIO}, n_splits={N_SPLITS} "
+        f"=> approx train/val/test = "
+        f"{TRAIN_RATIO:.2f}/{VAL_RATIO:.2f}/{TEST_RATIO:.2f}"
+    )
+
+    os.makedirs(RESULT_ROOT, exist_ok=True)
+
+    df, data_audit = load_psa_data(DATA_PATH)
+    save_json(data_audit, os.path.join(RESULT_ROOT, "data_audit.json"))
+
+    print("\nData Audit:")
+    for k, v in data_audit.items():
+        print(f"  {k}: {v}")
+
+    min_cache_len = min(NS)
+    patient_cache = build_patient_cache(df, min_cache_len=min_cache_len)
+    patient_lookup = build_patient_lookup(patient_cache)
+
+    print(f"\nCached patients with >= {min_cache_len} PSA measurements: {len(patient_cache):,}")
+
+    raw_patient_count = int(data_audit["raw_patients"])
+    all_results: Dict[str, Any] = {}
+
+    for task in RUN_TASKS:
+        if task not in TASK_CONFIGS:
+            raise ValueError(f"Unknown task in RUN_TASKS: {task}")
+
+        all_results[task] = run_task_grid(
+            patient_cache=patient_cache,
+            patient_lookup=patient_lookup,
+            raw_patient_count=raw_patient_count,
+            task=task,
+        )
+
+    save_json(
+        all_results,
+        os.path.join(RESULT_ROOT, "all_experiment_results.json"),
+    )
+
+    print("\nAll requested tasks completed.")
+    print(f"Results are under: {RESULT_ROOT}")
+    print(
+        "\nTo regenerate retained plots later without retraining, run:\n"
+        f"    regenerate_all_plots_under_result_root(r'{RESULT_ROOT}')"
+    )
+
+
+if __name__ == "__main__" and AUTO_RUN:
+    main()
